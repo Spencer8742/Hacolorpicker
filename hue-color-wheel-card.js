@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.3.1";
+const CARD_VERSION = "0.3.2";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -20,6 +20,7 @@ const DEFAULTS = {
   show_labels: true,
   show_presets: true,
   pin_size: 36,
+  merge_ring_size: 3,
 };
 
 const SERVICE_THROTTLE_MS = 150; // ~6-7 calls/sec max while dragging
@@ -209,6 +210,7 @@ class HueColorWheelCard extends HTMLElement {
     const cfg = this._config;
     const pinSize = cfg.pin_size;
     const hit = Math.max(pinSize, 44); // mobile touch target
+    const ring = cfg.merge_ring_size; // white merge-target ring thickness
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -262,7 +264,7 @@ class HueColorWheelCard extends HTMLElement {
         .pin.cluster-hidden { opacity: 0; pointer-events: none; }
         .pin.merge-target .pin-circle {
           transform: scale(1.25);
-          box-shadow: 0 0 0 3px rgba(255,255,255,0.7), 0 2px 6px rgba(0,0,0,0.5);
+          box-shadow: 0 0 0 ${ring}px rgba(255,255,255,0.7), 0 2px 6px rgba(0,0,0,0.5);
         }
         .pin-circle {
           width: ${pinSize}px;
