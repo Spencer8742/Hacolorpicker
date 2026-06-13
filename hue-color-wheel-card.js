@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.3.1";
+const CARD_VERSION = "0.3.3";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -20,6 +20,8 @@ const DEFAULTS = {
   show_labels: true,
   show_presets: true,
   pin_size: 36,
+  merge_ring_size: 3,
+  merge_distance: null, // px between pin centers to trigger a merge; null = pin_size
 };
 
 const SERVICE_THROTTLE_MS = 150; // ~6-7 calls/sec max while dragging
@@ -209,6 +211,7 @@ class HueColorWheelCard extends HTMLElement {
     const cfg = this._config;
     const pinSize = cfg.pin_size;
     const hit = Math.max(pinSize, 44); // mobile touch target
+    const ring = cfg.merge_ring_size; // white merge-target ring thickness
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -262,7 +265,7 @@ class HueColorWheelCard extends HTMLElement {
         .pin.cluster-hidden { opacity: 0; pointer-events: none; }
         .pin.merge-target .pin-circle {
           transform: scale(1.25);
-          box-shadow: 0 0 0 3px rgba(255,255,255,0.7), 0 2px 6px rgba(0,0,0,0.5);
+          box-shadow: 0 0 0 ${ring}px rgba(255,255,255,0.7), 0 2px 6px rgba(0,0,0,0.5);
         }
         .pin-circle {
           width: ${pinSize}px;
@@ -618,7 +621,7 @@ class HueColorWheelCard extends HTMLElement {
       if (!strayed && isOn && cur && this._radius > 0) {
         const a = hsToXy(cur[0], cur[1], this._radius);
         const b = hsToXy(cluster.hs[0], cluster.hs[1], this._radius);
-        strayed = Math.hypot(a[0] - b[0], a[1] - b[1]) > this._config.pin_size;
+        strayed = Math.hypot(a[0] - b[0], a[1] - b[1]) > this._mergeDistance();
       }
       if (strayed) {
         this._removeFromCluster(entity);
@@ -893,6 +896,12 @@ class HueColorWheelCard extends HTMLElement {
     }
   }
 
+  /** Snap distance (px between pin centers) for merging / staying merged. */
+  _mergeDistance() {
+    const d = this._config.merge_distance;
+    return d != null ? d : this._config.pin_size;
+  }
+
   _refreshClusterStyles() {
     for (const [entity, pin] of this._pins) {
       const cluster = this._clusterFor(entity);
@@ -907,7 +916,7 @@ class HueColorWheelCard extends HTMLElement {
   _findMergeTarget(x, y, excludeSet) {
     const r = this._radius;
     let best = null;
-    let bestDist = this._config.pin_size; // snap distance between centers
+    let bestDist = this._mergeDistance(); // snap distance between centers
     for (const [id, pin] of this._pins) {
       if (excludeSet.has(id)) continue;
       if (pin.el.style.display === "none") continue;
