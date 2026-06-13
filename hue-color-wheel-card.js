@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.4.0";
+const CARD_VERSION = "0.4.1";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -106,7 +106,14 @@ class HueColorWheelCard extends HTMLElement {
     this._pins = new Map(); // entity -> {el, circle, label}
     this._lastHs = new Map(); // entity -> [h, s] last seen while on
     this._lastBrightness = new Map(); // entity -> pct last seen while on
-    this._saveTimer = null; // debounced persistence
+    this._saveTimer = null; // debounced remote sync
+    this._pendingSave = null; // value awaiting remote sync
+    this._restoring = false; // true while loading persisted state
+    // flush the cross-device sync when the page is hidden or unloaded;
+    // localStorage is already written synchronously on every change
+    this._flushHandler = () => {
+      if (this._pendingSave) this._syncRemote();
+    };
     this._multi = new Set(); // entities selected for group drag / brightness
     this._selectedCluster = null; // cluster selected for brightness (first tap)
     this._clusters = []; // merged pin stacks: {members: [entity...], hs}
@@ -146,6 +153,8 @@ class HueColorWheelCard extends HTMLElement {
   }
 
   connectedCallback() {
+    window.addEventListener("pagehide", this._flushHandler);
+    window.addEventListener("visibilitychange", this._flushHandler);
     this._maybeBuild();
   }
 
@@ -157,10 +166,9 @@ class HueColorWheelCard extends HTMLElement {
     for (const p of this._pendingCalls.values()) clearTimeout(p.timer);
     this._pendingCalls.clear();
     clearTimeout(this._animTimer);
-    if (this._saveTimer) {
-      clearTimeout(this._saveTimer);
-      this._saveStore(); // flush before the card goes away
-    }
+    window.removeEventListener("pagehide", this._flushHandler);
+    window.removeEventListener("visibilitychange", this._flushHandler);
+    if (this._pendingSave) this._syncRemote(); // flush remote before teardown
     this._built = false;
   }
 
@@ -1071,7 +1079,15 @@ class HueColorWheelCard extends HTMLElement {
   }
 
   async _restoreStore() {
-    const data = await this._loadStore();
+    // block saves while loading so live hass updates can't clobber stored
+    // state on the localStorage fallback path before we've read it back
+    this._restoring = true;
+    let data;
+    try {
+      data = await this._loadStore();
+    } finally {
+      this._restoring = false;
+    }
     if (!data || !this._built) return;
     if (data.presets && typeof data.presets === "object") {
       this._presets = data.presets;
@@ -1105,31 +1121,42 @@ class HueColorWheelCard extends HTMLElement {
     this._updateAll();
   }
 
-  _scheduleSave() {
-    clearTimeout(this._saveTimer);
-    this._saveTimer = setTimeout(() => this._saveStore(), 2000);
-  }
-
-  _saveStore() {
-    this._saveTimer = null;
-    if (!this._lights) return;
-    const value = {
+  _buildStoreValue() {
+    return {
       v: 1,
       clusters: this._clusters.map((c) => ({ members: [...c.members], hs: c.hs })),
       lastHs: Object.fromEntries(this._lastHs),
       lastBrightness: Object.fromEntries(this._lastBrightness),
       presets: this._presets,
     };
+  }
+
+  /**
+   * Persist immediately to localStorage (synchronous, survives a refresh or
+   * app close at any moment) and debounce the per-user server sync that
+   * carries state to other browsers/devices.
+   */
+  _scheduleSave() {
+    if (!this._lights || this._restoring) return;
+    const value = (this._pendingSave = this._buildStoreValue());
     try {
       localStorage.setItem(this._localKey(), JSON.stringify(value));
     } catch (e) {
       /* storage full or unavailable */
     }
-    if (this._hass) {
-      this._hass
-        .callWS({ type: "frontend/set_user_data", key: this._storeKey(), value })
-        .catch(() => {});
-    }
+    clearTimeout(this._saveTimer);
+    this._saveTimer = setTimeout(() => this._syncRemote(), 1500);
+  }
+
+  _syncRemote() {
+    clearTimeout(this._saveTimer);
+    this._saveTimer = null;
+    const value = this._pendingSave;
+    if (!value || !this._hass) return;
+    this._pendingSave = null;
+    this._hass
+      .callWS({ type: "frontend/set_user_data", key: this._storeKey(), value })
+      .catch(() => {});
   }
 
   /* ------------------------------------------------------------ presets */
