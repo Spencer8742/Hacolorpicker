@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.5.0";
+const CARD_VERSION = "0.6.0";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -119,6 +119,11 @@ class HueColorWheelCard extends HTMLElement {
     this._storeUpdatedAt = 0; // updatedAt of the store data we've applied
     this._warnedWrite = false; // logged a remote-write failure once
     this._conn = null; // hass.connection we've hooked 'ready' on
+    // Storage backend: "shared" = cross-user hue_color_wheel integration,
+    // "user" = per-user frontend/set_user_data fallback, null = not detected.
+    this._storageMode = null;
+    this._subscribed = false; // live push subscription active
+    this._unsub = null; // unsubscribe fn for the live push
     // When the page/app comes to the foreground, pull the latest shared
     // state from the server (covers "I changed it on another device"); when
     // it goes to the background, flush any pending write first.
@@ -196,6 +201,11 @@ class HueColorWheelCard extends HTMLElement {
     clearTimeout(this._animTimer);
     window.removeEventListener("pagehide", this._flushHandler);
     document.removeEventListener("visibilitychange", this._visibilityHandler);
+    if (this._unsub) {
+      this._unsub();
+      this._unsub = null;
+      this._subscribed = false;
+    }
     if (this._pendingSave) this._syncRemote(); // flush remote before teardown
     this._built = false;
   }
@@ -1172,7 +1182,29 @@ class HueColorWheelCard extends HTMLElement {
     return null;
   }
 
+  /**
+   * Read the shared/per-user remote store. Prefers the cross-user
+   * hue_color_wheel integration; if that command isn't registered (component
+   * not installed) it permanently falls back to per-user frontend storage.
+   */
   async _readRemote() {
+    if (this._storageMode !== "user") {
+      try {
+        const resp = await this._hass.callWS({
+          type: "hue_color_wheel/get",
+          key: this._storeKey(),
+        });
+        this._storageMode = "shared";
+        this._ensureSubscribed();
+        return resp ? resp.value : null;
+      } catch (e) {
+        if (e && e.code === "unknown_command") {
+          this._storageMode = "user"; // integration not installed
+        } else {
+          return null; // transient error; keep mode, retry later
+        }
+      }
+    }
     try {
       const resp = await this._hass.callWS({
         type: "frontend/get_user_data",
@@ -1183,6 +1215,41 @@ class HueColorWheelCard extends HTMLElement {
       // older HA or transient WS error; caller falls back to local
     }
     return null;
+  }
+
+  /** Subscribe to live push from the shared backend (real-time sync). */
+  _ensureSubscribed() {
+    if (
+      this._subscribed ||
+      this._storageMode !== "shared" ||
+      !this._hass ||
+      !this._hass.connection ||
+      typeof this._hass.connection.subscribeMessage !== "function"
+    ) {
+      return;
+    }
+    this._subscribed = true;
+    this._hass.connection
+      .subscribeMessage((ev) => this._onRemotePush(ev), {
+        type: "hue_color_wheel/subscribe",
+        key: this._storeKey(),
+      })
+      .then((unsub) => {
+        this._unsub = unsub;
+      })
+      .catch(() => {
+        this._subscribed = false; // allow a later retry
+      });
+  }
+
+  _onRemotePush(ev) {
+    const value = ev && ev.value;
+    if (!value || this._drag) return;
+    if ((value.updatedAt || 0) > this._storeUpdatedAt) {
+      this._applyStore(value);
+      this._writeLocal(value);
+      if (this._built) this._updateAll();
+    }
   }
 
   /**
@@ -1285,15 +1352,22 @@ class HueColorWheelCard extends HTMLElement {
 
   _writeRemote(value) {
     if (!this._hass) return;
+    const shared = this._storageMode !== "user";
+    const type = shared ? "hue_color_wheel/set" : "frontend/set_user_data";
     this._hass
-      .callWS({ type: "frontend/set_user_data", key: this._storeKey(), value })
+      .callWS({ type, key: this._storeKey(), value })
       .catch((err) => {
+        if (shared && err && err.code === "unknown_command") {
+          // shared backend not installed: fall back to per-user storage
+          this._storageMode = "user";
+          this._writeRemote(value);
+          return;
+        }
         if (!this._warnedWrite) {
           this._warnedWrite = true;
           console.warn(
-            "hue-color-wheel-card: could not save state to Home Assistant " +
-              "(frontend/set_user_data failed); cross-device sync disabled, " +
-              "falling back to this browser only.",
+            "hue-color-wheel-card: could not save state to Home Assistant; " +
+              "cross-device sync disabled, falling back to this browser only.",
             err
           );
         }

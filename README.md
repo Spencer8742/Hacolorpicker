@@ -53,6 +53,33 @@ time. No build step, no dependencies — a single JS file.
 
 3. Add the card to a dashboard.
 
+### Optional: cross-user sync (shared stacks & presets)
+
+By default the card's metadata (merged stacks, presets, off-light positions)
+is stored **per Home Assistant user** — it syncs across all of that user's
+own devices and browsers, but not between different HA login accounts.
+
+To share that state across *all* users (e.g. you and a partner see the same
+stacks), install the bundled backend integration. It adds a small shared,
+server-side store and gives **real-time** updates — a change by one user
+appears instantly for everyone.
+
+1. Copy the `custom_components/hue_color_wheel/` folder into your Home
+   Assistant `<config>/custom_components/` directory (so you have
+   `<config>/custom_components/hue_color_wheel/__init__.py`).
+2. Add this line to `configuration.yaml`:
+
+   ```yaml
+   hue_color_wheel:
+   ```
+
+3. Restart Home Assistant.
+
+The card **auto-detects** the integration — no card config change needed. If
+it isn't installed, the card silently uses per-user storage instead. Any
+authenticated user can read and write the shared state (that shared
+visibility is the point); the data persists across restarts.
+
 ## Configuration
 
 ### Explicit light list
@@ -159,6 +186,11 @@ Either `lights` or `auto_entities` is required.
     user-data API), the card logs a one-time console warning and keeps
     working from the local cache (that device just won't sync).
   - Presets saved by pre-0.4 versions of the card are migrated automatically.
+  - **Cross-user**: install the optional `hue_color_wheel` backend
+    integration (see Installation) to share this metadata across *all* HA
+    users with real-time push, instead of per-user. The card auto-detects it
+    and migrates this device's existing state into the shared store on first
+    load.
 - A stack dissolves on its own if a member turns off or something
   external (automation, Hue app) moves a member's color visibly away
   from the stack. Tap a stack once to control its brightness as a group;
