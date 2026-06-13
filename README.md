@@ -9,6 +9,11 @@ time. No build step, no dependencies — a single JS file.
 
 - Full 360° hue wheel; saturation grows from white at the center to fully
   saturated at the rim.
+- **Color / white toggle**: a small pill below the wheel switches between the
+  color wheel and a **white color-temperature** wheel (warm amber at the top,
+  cool blue-white at the bottom). In white mode, dragging a pin up/down sets
+  the light's `color_temp` instead of `hs_color`. Color-temp-only lights
+  (which can't show on the color wheel) become draggable in white mode.
 - One labeled pin per configured light, positioned at its current
   `hs_color` and filled with its actual current color (`rgb_color`).
 - Drag a pin (mouse or touch) to call `light.turn_on` with the new
@@ -20,8 +25,10 @@ time. No build step, no dependencies — a single JS file.
 - **Merge by drop (like the Hue app)**: drag a pin onto another pin — the
   target highlights while you hover, and dropping snaps them into a single
   stacked pin with a count badge. The stack drags as one unit and all its
-  lights share one color. Tap the stack to split it back apart (the pins
-  fan out with a smooth animation).
+  lights share one color. **Tap the stack to open it into a ring** (a Hue-
+  style "well" with the member pins around the rim); **drag a pin out of the
+  ring to remove just that light** from the group, while the rest stay
+  grouped. Tap the empty wheel to close the ring.
 - **Multi-select & group drag**: tap several pins to select them, then drag
   any selected pin — the whole group moves together, keeping its relative
   arrangement on the wheel. The brightness slider applies to the selection.
@@ -98,6 +105,7 @@ wheel_size: 300          # wheel diameter in px (max; scales down responsively),
 show_brightness: true    # show the brightness slider, default true
 show_labels: true        # show labels under pins, default true
 show_presets: true       # show the preset save button and chips, default true
+show_white_toggle: true  # show the color/white (temperature) mode toggle, default true
 pin_size: 36             # pin diameter in px, default 36
 merge_ring_size: 3       # thickness of the white merge highlight ring in px, default 3
 merge_distance: 36       # px between pin centers to trigger a merge, default = pin_size
@@ -133,6 +141,7 @@ must match.
 | `show_brightness` | bool | `true` | Show the brightness slider. |
 | `show_labels` | bool | `true` | Show pin labels. |
 | `show_presets` | bool | `true` | Show the preset save button and preset chips. |
+| `show_white_toggle` | bool | `true` | Show the color/white color-temperature mode toggle below the wheel. |
 | `pin_size` | number | `36` | Pin diameter in px (touch target is at least 44 px regardless). |
 | `merge_ring_size` | number | `3` | Thickness in px of the white ring that highlights a pin while another pin is dragged over it to merge. |
 | `merge_distance` | number | `pin_size` | Distance in px between pin centers at which a drag snaps into a merge. Larger values make pins easier to combine (and keep them merged until they drift further apart). |
@@ -145,7 +154,10 @@ Either `lights` or `auto_entities` is required.
 | ------- | ------ |
 | Drag a pin | Live color change for that light (`hs_color`), throttled during drag |
 | Drop a pin onto another pin | Merge them into a stacked pin (badge shows the count); the stack moves as one |
-| Tap a stacked pin | Split the stack — pins fan back out around the spot |
+| Tap a stacked pin | Open it into a ring (well) with the members around the rim |
+| Drag a pin out of the ring | Remove just that light from the group at the dropped color |
+| Drag a pin back into the ring | Keep it in the group |
+| Tap the empty wheel | Close the ring |
 | Tap an on light's pin | Toggle it in/out of the selection (selected pins show a ring) |
 | Tap several pins, then drag one | The whole selection moves together as a group |
 | Tap an off light's pin | Turn it on |
@@ -193,5 +205,10 @@ Either `lights` or `auto_entities` is required.
     load.
 - A stack dissolves on its own if a member turns off or something
   external (automation, Hue app) moves a member's color visibly away
-  from the stack. Tap a stack once to control its brightness as a group;
-  tap it again to split it.
+  from the stack. Tap a stack to open its ring — the whole group is
+  selected for the brightness slider while open — and drag individual pins
+  out of the ring to remove them.
+- Merging/stacks are a **color-mode** feature. In white (temperature) mode
+  every light shows as its own pin; switching back to color mode restores
+  any stacks. The white-mode wheel is a vertical warm→cool gradient, so a
+  pin's vertical position is its temperature (horizontal is just spacing).
