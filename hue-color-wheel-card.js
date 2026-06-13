@@ -12,6 +12,8 @@
  * No build step, no dependencies.
  */
 
+const CARD_VERSION = "0.2.1";
+
 const DEFAULTS = {
   wheel_size: 300,
   show_brightness: true,
@@ -227,10 +229,12 @@ class HueColorWheelCard extends HTMLElement {
           border-radius: 50%;
           box-shadow: 0 0 0 1px rgba(255,255,255,0.08), 0 4px 24px rgba(0,0,0,0.4);
         }
-        .pins { position: absolute; inset: 0; }
+        /* let empty-area taps fall through to the canvas; pins re-enable hits */
+        .pins { position: absolute; inset: 0; pointer-events: none; }
         .pin {
           position: absolute;
           left: 0; top: 0;
+          pointer-events: auto;
           width: ${hit}px;
           height: ${hit}px;
           margin-left: ${-hit / 2}px;
@@ -369,7 +373,8 @@ class HueColorWheelCard extends HTMLElement {
         }
         .chip-del:hover { opacity: 1; }
         .save-form { display: inline-flex; align-items: center; gap: 6px; }
-        .save-form[hidden] { display: none; }
+        /* author display rules above would defeat the hidden attribute */
+        .save-form[hidden], .save-btn[hidden] { display: none; }
         .save-form input {
           font: inherit;
           font-size: 13px;
@@ -917,6 +922,12 @@ class HueColorWheelCard extends HTMLElement {
 }
 
 customElements.define("hue-color-wheel-card", HueColorWheelCard);
+
+console.info(
+  `%c HUE-COLOR-WHEEL-CARD %c v${CARD_VERSION} `,
+  "background:#3f51b5;color:#fff;padding:2px 6px;border-radius:4px 0 0 4px",
+  "background:#222;color:#9fa8da;padding:2px 6px;border-radius:0 4px 4px 0"
+);
 
 window.customCards = window.customCards || [];
 window.customCards.push({
