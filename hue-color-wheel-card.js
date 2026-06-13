@@ -12,13 +12,14 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.7.0";
+const CARD_VERSION = "0.8.0";
 
 const DEFAULTS = {
   wheel_size: 300,
   show_brightness: true,
   show_labels: true,
   show_presets: true,
+  show_white_toggle: true, // show the color/white (temperature) mode toggle
   pin_size: 36,
   merge_ring_size: 3,
   merge_distance: null, // px between pin centers to trigger a merge; null = pin_size
@@ -36,7 +37,30 @@ const CLUSTER_SETTLE_MS = 3000;
 
 const COLOR_MODES_WHEEL = ["hs", "xy", "rgb", "rgbw", "rgbww"];
 
+// white-mode color-temperature range (Kelvin) used for the gradient and pin
+// positioning; per-light sends are clamped to each light's own range.
+const TEMP_MIN_K = 2000; // warmest (amber) — top of the wheel
+const TEMP_MAX_K = 6500; // coolest (blue-white) — bottom of the wheel
+
 /* ---------------------------------------------------------------- color math */
+
+/** Approximate a color temperature in Kelvin as [r, g, b] 0-255. */
+function kelvinToRgb(kelvin) {
+  const t = Math.min(Math.max(kelvin, 1000), 40000) / 100;
+  let r, g, b;
+  if (t <= 66) {
+    r = 255;
+    g = 99.4708025861 * Math.log(t) - 161.1195681661;
+  } else {
+    r = 329.698727446 * Math.pow(t - 60, -0.1332047592);
+    g = 288.1221695283 * Math.pow(t - 60, -0.0755148492);
+  }
+  if (t >= 66) b = 255;
+  else if (t <= 19) b = 0;
+  else b = 138.5177312231 * Math.log(t - 10) - 305.0447927307;
+  const clamp = (v) => Math.round(Math.min(Math.max(v, 0), 255));
+  return [clamp(r), clamp(g), clamp(b)];
+}
 
 function hsv2rgb(h, s, v) {
   // h: 0-360, s: 0-1, v: 0-1 -> [r, g, b] 0-255
@@ -83,6 +107,19 @@ function xyToHs(dx, dy, radius) {
   return [hue, Math.round(sat * 10) / 10];
 }
 
+/** White mode: Kelvin -> vertical offset (warm at top, cool at bottom). */
+function tempToY(kelvin, radius) {
+  const frac = (Math.min(Math.max(kelvin, TEMP_MIN_K), TEMP_MAX_K) - TEMP_MIN_K) /
+    (TEMP_MAX_K - TEMP_MIN_K);
+  return -radius + frac * 2 * radius;
+}
+
+/** White mode: vertical offset -> Kelvin. */
+function yToTemp(y, radius) {
+  const frac = radius > 0 ? Math.min(Math.max((y + radius) / (2 * radius), 0), 1) : 0;
+  return Math.round(TEMP_MIN_K + frac * (TEMP_MAX_K - TEMP_MIN_K));
+}
+
 function globToRegex(glob) {
   const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
   return new RegExp(`^${escaped}$`);
@@ -112,6 +149,9 @@ class HueColorWheelCard extends HTMLElement {
     this._lights = null; // resolved [{entity, label}]
     this._pins = new Map(); // entity -> {el, circle, label}
     this._lastHs = new Map(); // entity -> [h, s] last seen while on
+    this._lastTemp = new Map(); // entity -> kelvin last seen (white mode)
+    this._whiteX = new Map(); // entity -> x offset for the white-mode pin
+    this._mode = "color"; // "color" (hue wheel) or "white" (temp gradient)
     this._lastBrightness = new Map(); // entity -> pct last seen while on
     this._saveTimer = null; // debounced remote sync
     this._pendingSave = null; // value awaiting remote sync
@@ -257,6 +297,17 @@ class HueColorWheelCard extends HTMLElement {
     return modes.some((m) => COLOR_MODES_WHEEL.includes(m));
   }
 
+  _supportsTemp(stateObj) {
+    const modes = stateObj?.attributes?.supported_color_modes;
+    return Array.isArray(modes) && modes.includes("color_temp");
+  }
+
+  _supportsMode(stateObj) {
+    return this._mode === "white"
+      ? this._supportsTemp(stateObj)
+      : this._supportsColor(stateObj);
+  }
+
   /* ------------------------------------------------------------ DOM build */
 
   _maybeBuild() {
@@ -347,6 +398,41 @@ class HueColorWheelCard extends HTMLElement {
           z-index: 1;
         }
         .expand-tray[hidden] { display: none; }
+        .mode-toggle {
+          display: ${cfg.show_white_toggle ? "inline-flex" : "none"};
+          gap: 2px;
+          margin: 14px auto 0;
+          padding: 3px;
+          border-radius: 22px;
+          background: rgba(255,255,255,0.08);
+          width: fit-content;
+        }
+        .mode-btn {
+          width: 40px;
+          height: 30px;
+          border: none;
+          border-radius: 18px;
+          background: transparent;
+          cursor: pointer;
+          padding: 0;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+        }
+        .mode-btn .swatch {
+          width: 24px;
+          height: 24px;
+          border-radius: 50%;
+          box-sizing: border-box;
+          border: 2px solid rgba(255,255,255,0.85);
+        }
+        .mode-btn.color .swatch {
+          background: conic-gradient(red, yellow, lime, cyan, blue, magenta, red);
+        }
+        .mode-btn.white .swatch {
+          background: linear-gradient(180deg, #ffb15e, #fff3e0 50%, #cfe4ff);
+        }
+        .mode-btn.active { background: rgba(255,255,255,0.22); }
         .pin.merge-target .pin-circle {
           transform: scale(1.25);
           box-shadow: 0 0 0 ${ring}px rgba(255,255,255,0.7), 0 2px 6px rgba(0,0,0,0.5);
@@ -516,6 +602,10 @@ class HueColorWheelCard extends HTMLElement {
           <div class="expand-tray" hidden></div>
           <div class="pins"></div>
         </div>
+        <div class="mode-toggle">
+          <button class="mode-btn color active" title="Color" aria-label="Color"><span class="swatch"></span></button>
+          <button class="mode-btn white" title="White / temperature" aria-label="White temperature"><span class="swatch"></span></button>
+        </div>
         <div class="brightness">
           <span class="brightness-label">All lights</span>
           <input type="range" min="1" max="100" value="100" aria-label="Brightness">
@@ -537,6 +627,10 @@ class HueColorWheelCard extends HTMLElement {
     this._canvas = this.shadowRoot.querySelector("canvas");
     this._trayEl = this.shadowRoot.querySelector(".expand-tray");
     this._pinsEl = this.shadowRoot.querySelector(".pins");
+    this._modeColorBtn = this.shadowRoot.querySelector(".mode-btn.color");
+    this._modeWhiteBtn = this.shadowRoot.querySelector(".mode-btn.white");
+    this._modeColorBtn.addEventListener("click", () => this._setMode("color"));
+    this._modeWhiteBtn.addEventListener("click", () => this._setMode("white"));
     this._brightnessLabel = this.shadowRoot.querySelector(".brightness-label");
     this._slider = this.shadowRoot.querySelector('input[type="range"]');
     this._ctNote = this.shadowRoot.querySelector(".ct-note");
@@ -641,6 +735,16 @@ class HueColorWheelCard extends HTMLElement {
     const data = image.data;
     const c = px / 2;
     const r = px / 2;
+    const white = this._mode === "white";
+    // precompute the white-mode vertical gradient (warm top -> cool bottom)
+    let tempRow = null;
+    if (white) {
+      tempRow = new Array(px);
+      for (let y = 0; y < px; y++) {
+        const frac = y / (px - 1);
+        tempRow[y] = kelvinToRgb(TEMP_MIN_K + frac * (TEMP_MAX_K - TEMP_MIN_K));
+      }
+    }
     for (let y = 0; y < px; y++) {
       for (let x = 0; x < px; x++) {
         const dx = x - c;
@@ -648,10 +752,15 @@ class HueColorWheelCard extends HTMLElement {
         const dist = Math.sqrt(dx * dx + dy * dy);
         const i = (y * px + x) * 4;
         if (dist > r + 1) continue; // transparent outside
-        let hue = (Math.atan2(-dy, dx) * 180) / Math.PI;
-        if (hue < 0) hue += 360;
-        const sat = Math.min(dist / r, 1);
-        const [rr, gg, bb] = hsv2rgb(hue, sat, 1);
+        let rr, gg, bb;
+        if (white) {
+          [rr, gg, bb] = tempRow[y];
+        } else {
+          let hue = (Math.atan2(-dy, dx) * 180) / Math.PI;
+          if (hue < 0) hue += 360;
+          const sat = Math.min(dist / r, 1);
+          [rr, gg, bb] = hsv2rgb(hue, sat, 1);
+        }
         data[i] = rr;
         data[i + 1] = gg;
         data[i + 2] = bb;
@@ -669,16 +778,18 @@ class HueColorWheelCard extends HTMLElement {
     const unsupported = [];
     for (const [entity, pin] of this._pins) {
       const stateObj = this._hass.states[entity];
-      if (stateObj && !this._supportsColor(stateObj)) {
+      if (stateObj && !this._supportsMode(stateObj)) {
         pin.el.style.display = "none";
         unsupported.push(stateObj.attributes.friendly_name || entity);
         continue;
       }
+      pin.el.style.display = "";
       this._updatePin(entity, pin, stateObj);
     }
     this._ctNote.hidden = unsupported.length === 0;
     if (unsupported.length) {
-      this._ctNote.textContent = `Not shown (no color support): ${unsupported.join(", ")}`;
+      const what = this._mode === "white" ? "no white/temperature support" : "no color support";
+      this._ctNote.textContent = `Not shown (${what}): ${unsupported.join(", ")}`;
     }
     this._refreshClusterStyles();
     this._updateBrightnessUi();
@@ -708,6 +819,13 @@ class HueColorWheelCard extends HTMLElement {
         this._scheduleSave();
       }
     }
+    const kelvin = exists && stateObj.attributes.color_temp_kelvin;
+    if (isOn && kelvin) {
+      if (this._lastTemp.get(entity) !== kelvin) {
+        this._lastTemp.set(entity, kelvin);
+        this._scheduleSave();
+      }
+    }
     if (isOn && stateObj.attributes.brightness != null) {
       const pct = Math.max(1, Math.round((stateObj.attributes.brightness / 255) * 100));
       if (this._lastBrightness.get(entity) !== pct) {
@@ -722,7 +840,9 @@ class HueColorWheelCard extends HTMLElement {
     // fast drag (bulbs catching up) would scatter the group right after you
     // let go. Straying also uses a larger threshold than merging
     // (hysteresis) so per-bulb color quantization at rest can't trip it.
-    let cluster = this._clusterFor(entity);
+    // Clustering is a color-mode feature; in white mode every pin is shown
+    // and positioned individually by its temperature.
+    let cluster = this._mode === "white" ? null : this._clusterFor(entity);
     const settling = cluster && cluster.settleUntil && Date.now() < cluster.settleUntil;
     // While a ring is open, removal is explicit (drag a pin out), so never
     // auto-stray its members.
@@ -755,18 +875,15 @@ class HueColorWheelCard extends HTMLElement {
     // a ring member's position is owned by the layout / its extract drag
     if (expandedMember) return;
 
-    const hs = cluster ? cluster.hs : this._lastHs.get(entity) || [0, 0];
-    this._positionPin(pin, hs);
+    const [x, y] = this._pinXY(entity, cluster);
+    pin.el.style.transform = `translate(${this._radius + x}px, ${this._radius + y}px)`;
 
     if (unavailable) {
       pin.circle.style.background = "#555";
       pin.circle.textContent = "!";
     } else {
       pin.circle.textContent = "";
-      const rgb = isOn && Array.isArray(stateObj.attributes.rgb_color)
-        ? stateObj.attributes.rgb_color
-        : hsv2rgb(hs[0], hs[1] / 100, 1);
-      pin.circle.style.background = rgbCss(rgb);
+      pin.circle.style.background = rgbCss(this._pinRgb(entity, stateObj, cluster));
     }
   }
 
@@ -777,14 +894,49 @@ class HueColorWheelCard extends HTMLElement {
     pin.el.style.transform = `translate(${r + x}px, ${r + y}px)`;
   }
 
+  /** Wheel-local [x, y] for a pin in the current mode. */
+  _pinXY(entity, cluster) {
+    const r = this._radius;
+    if (this._mode === "white") {
+      const k = this._lastTemp.get(entity) || TEMP_MIN_K;
+      let x = this._whiteX.get(entity);
+      if (x == null) x = this._defaultWhiteX(entity);
+      return [x, tempToY(k, r)];
+    }
+    const hs = cluster ? cluster.hs : this._lastHs.get(entity) || [0, 0];
+    return hsToXy(hs[0], hs[1], r);
+  }
+
+  /** Fill color for a pin in the current mode. */
+  _pinRgb(entity, stateObj, cluster) {
+    const isOn = stateObj && stateObj.state === "on";
+    if (this._mode === "white") {
+      return kelvinToRgb(this._lastTemp.get(entity) || TEMP_MIN_K);
+    }
+    if (isOn && Array.isArray(stateObj.attributes.rgb_color)) {
+      return stateObj.attributes.rgb_color;
+    }
+    const hs = cluster ? cluster.hs : this._lastHs.get(entity) || [0, 0];
+    return hsv2rgb(hs[0], hs[1] / 100, 1);
+  }
+
+  /** Spread white-mode pins horizontally by index so they don't fully overlap. */
+  _defaultWhiteX(entity) {
+    const ids = this._lights.map((l) => l.entity);
+    const i = ids.indexOf(entity);
+    const n = Math.max(ids.length, 1);
+    const span = this._radius * 0.7;
+    return n > 1 ? -span / 2 + (span * i) / (n - 1) : 0;
+  }
+
   _positionAllPins() {
     for (const [entity, pin] of this._pins) {
       if (this._drag && this._drag.members.has(entity)) continue;
       // members of an open ring are positioned by _layoutExpanded, not here
       if (this._expandedCluster && this._expandedCluster.members.includes(entity)) continue;
-      const cluster = this._clusterFor(entity);
-      const hs = cluster ? cluster.hs : this._lastHs.get(entity) || [0, 0];
-      this._positionPin(pin, hs);
+      const cluster = this._mode === "white" ? null : this._clusterFor(entity);
+      const [x, y] = this._pinXY(entity, cluster);
+      pin.el.style.transform = `translate(${this._radius + x}px, ${this._radius + y}px)`;
     }
   }
 
@@ -803,11 +955,17 @@ class HueColorWheelCard extends HTMLElement {
     // "extract" drag: only that pin moves, and dropping it clear of the well
     // removes it from the group.
     const extract =
-      this._expandedCluster && this._expandedCluster.members.includes(entity);
+      this._mode !== "white" &&
+      this._expandedCluster &&
+      this._expandedCluster.members.includes(entity);
 
     let group;
     const startXy = new Map();
-    if (extract) {
+    if (this._mode === "white") {
+      // white mode: no clustering — drag the single grabbed pin's temperature
+      group = [entity];
+      startXy.set(entity, this._pinXY(entity, null));
+    } else if (extract) {
       group = [entity];
       const slot = this._expand?.slots.get(entity) ||
         hsToXy(this._expandedCluster.hs[0], this._expandedCluster.hs[1], this._radius);
@@ -893,6 +1051,7 @@ class HueColorWheelCard extends HTMLElement {
       moved: false,
       mergeTarget: null,
       lastHs: new Map(),
+      lastTemp: new Map(),
       cleanup,
     };
 
@@ -930,6 +1089,27 @@ class HueColorWheelCard extends HTMLElement {
       }
     }
     const r = this._radius;
+
+    if (this._mode === "white") {
+      // drag up/down to set color temperature; horizontal is kept for spacing
+      const [sx, sy] = drag.startXy.get(entity);
+      let x = sx + dxp;
+      let y = sy + dyp;
+      const d = Math.hypot(x, y);
+      if (d > r && d > 0) {
+        x *= r / d;
+        y *= r / d;
+      }
+      const k = yToTemp(y, r);
+      drag.lastTemp.set(entity, k);
+      this._whiteX.set(entity, x);
+      const pin = this._pins.get(entity);
+      pin.el.style.transform = `translate(${r + x}px, ${r + y}px)`;
+      pin.circle.style.background = rgbCss(kelvinToRgb(k));
+      pin.el.classList.remove("off");
+      this._throttledColorCall(entity, k); // value-agnostic; _sendValue sends temp
+      return;
+    }
 
     if (drag.extract) {
       // single pin follows the finger; it leaves the group if pulled clear
@@ -1002,6 +1182,16 @@ class HueColorWheelCard extends HTMLElement {
 
     if (!drag.moved) {
       this._onPinTap(entity);
+      return;
+    }
+
+    if (this._mode === "white") {
+      const k = drag.lastTemp.get(entity);
+      if (k != null) {
+        this._lastTemp.set(entity, k);
+        this._sendTemp(entity, k); // final, authoritative call
+      }
+      this._scheduleSave();
       return;
     }
 
@@ -1163,6 +1353,29 @@ class HueColorWheelCard extends HTMLElement {
     this._updateBrightnessUi();
   }
 
+  /* ------------------------------------------------- color / white mode */
+
+  _setMode(mode) {
+    if (mode !== "color" && mode !== "white") return;
+    if (mode === this._mode) return;
+    this._applyMode(mode);
+    this._multi.clear();
+    this._selectedCluster = null;
+    this._refreshSelection();
+    this._updateAll();
+    this._scheduleSave();
+  }
+
+  /** Switch the wheel mode and redraw, without persisting (used by restore). */
+  _applyMode(mode) {
+    this._mode = mode;
+    if (this._expandedCluster) this._closeCluster();
+    if (this._modeColorBtn) this._modeColorBtn.classList.toggle("active", mode === "color");
+    if (this._modeWhiteBtn) this._modeWhiteBtn.classList.toggle("active", mode === "white");
+    this._renderedSize = 0; // force the wheel gradient to redraw for the mode
+    if (this._built) this._onResize();
+  }
+
   /* ------------------------------------------------------------ service calls */
 
   _throttledColorCall(entity, hs) {
@@ -1175,7 +1388,7 @@ class HueColorWheelCard extends HTMLElement {
       slot.pending = hs; // trailing value, sent when the timer fires
       return;
     }
-    this._sendColor(entity, hs);
+    this._sendValue(entity, hs);
     // widen the per-light interval for group drags so the total call
     // rate across the group stays in the same ballpark
     const groupSize = this._drag ? this._drag.members.size : 1;
@@ -1195,6 +1408,27 @@ class HueColorWheelCard extends HTMLElement {
       entity_id: entity,
       hs_color: [hs[0], hs[1]],
     });
+  }
+
+  _sendTemp(entity, kelvin) {
+    this._hass.callService("light", "turn_on", {
+      entity_id: entity,
+      color_temp_kelvin: this._clampKelvin(entity, kelvin),
+    });
+  }
+
+  /** Clamp a Kelvin value to the light's own supported range when known. */
+  _clampKelvin(entity, kelvin) {
+    const a = this._hass.states[entity]?.attributes || {};
+    const lo = a.min_color_temp_kelvin || TEMP_MIN_K;
+    const hi = a.max_color_temp_kelvin || TEMP_MAX_K;
+    return Math.round(Math.min(Math.max(kelvin, lo), hi));
+  }
+
+  /** Send the current value for the active mode (hs array or Kelvin number). */
+  _sendValue(entity, value) {
+    if (this._mode === "white") this._sendTemp(entity, value);
+    else this._sendColor(entity, value);
   }
 
   /* ------------------------------------------------------------ clusters */
@@ -1224,6 +1458,14 @@ class HueColorWheelCard extends HTMLElement {
   }
 
   _refreshClusterStyles() {
+    // white mode ignores clustering — every pin shows on its own
+    if (this._mode === "white") {
+      for (const [, pin] of this._pins) {
+        pin.el.classList.remove("cluster-hidden");
+        pin.badge.classList.remove("show");
+      }
+      return;
+    }
     const expanded = this._expandedCluster;
     for (const [entity, pin] of this._pins) {
       const cluster = this._clusterFor(entity);
@@ -1450,6 +1692,9 @@ class HueColorWheelCard extends HTMLElement {
       this._presets = data.presets;
       this._renderPresets();
     }
+    if ((data.mode === "color" || data.mode === "white") && data.mode !== this._mode) {
+      this._applyMode(data.mode);
+    }
     // For lights that are ON, live hass state is authoritative for their
     // color/brightness; stored values only fill in lights that are off.
     if (data.lastHs) {
@@ -1457,6 +1702,18 @@ class HueColorWheelCard extends HTMLElement {
         if (!this._pins.has(entity) || !Array.isArray(hs)) continue;
         if (this._hass?.states[entity]?.state === "on") continue;
         this._lastHs.set(entity, hs.slice(0, 2));
+      }
+    }
+    if (data.lastTemp) {
+      for (const [entity, k] of Object.entries(data.lastTemp)) {
+        if (!this._pins.has(entity)) continue;
+        if (this._hass?.states[entity]?.state === "on") continue;
+        this._lastTemp.set(entity, k);
+      }
+    }
+    if (data.whiteX) {
+      for (const [entity, x] of Object.entries(data.whiteX)) {
+        if (this._pins.has(entity)) this._whiteX.set(entity, x);
       }
     }
     if (data.lastBrightness) {
@@ -1485,8 +1742,11 @@ class HueColorWheelCard extends HTMLElement {
     return {
       v: 1,
       updatedAt: Date.now(),
+      mode: this._mode,
       clusters: this._clusters.map((c) => ({ members: [...c.members], hs: c.hs })),
       lastHs: Object.fromEntries(this._lastHs),
+      lastTemp: Object.fromEntries(this._lastTemp),
+      whiteX: Object.fromEntries(this._whiteX),
       lastBrightness: Object.fromEntries(this._lastBrightness),
       presets: this._presets,
     };
@@ -1683,7 +1943,8 @@ class HueColorWheelCard extends HTMLElement {
     // the representative pin is in _multi
     const result = new Set();
     for (const id of this._multi) {
-      const cluster = this._clusterFor(id);
+      // white mode ignores clustering, so each selected pin targets itself
+      const cluster = this._mode === "white" ? null : this._clusterFor(id);
       if (cluster) cluster.members.forEach((m) => result.add(m));
       else result.add(id);
     }
