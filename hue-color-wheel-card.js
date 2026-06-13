@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.4.4";
+const CARD_VERSION = "0.5.0";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -116,8 +116,19 @@ class HueColorWheelCard extends HTMLElement {
     this._saveTimer = null; // debounced remote sync
     this._pendingSave = null; // value awaiting remote sync
     this._restoring = false; // true while loading persisted state
-    // flush the cross-device sync when the page is hidden or unloaded;
-    // localStorage is already written synchronously on every change
+    this._storeUpdatedAt = 0; // updatedAt of the store data we've applied
+    this._warnedWrite = false; // logged a remote-write failure once
+    this._conn = null; // hass.connection we've hooked 'ready' on
+    // When the page/app comes to the foreground, pull the latest shared
+    // state from the server (covers "I changed it on another device"); when
+    // it goes to the background, flush any pending write first.
+    this._visibilityHandler = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        if (this._pendingSave) this._syncRemote();
+      } else {
+        this._syncFromServer();
+      }
+    };
     this._flushHandler = () => {
       if (this._pendingSave) this._syncRemote();
     };
@@ -147,6 +158,13 @@ class HueColorWheelCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    // Re-pull shared state whenever the WebSocket reconnects, so a device
+    // that was asleep/offline catches up on changes made elsewhere.
+    const conn = hass && hass.connection;
+    if (conn && conn !== this._conn && typeof conn.addEventListener === "function") {
+      this._conn = conn;
+      conn.addEventListener("ready", () => this._syncFromServer());
+    }
     this._maybeBuild();
     if (this._built) this._updateAll();
   }
@@ -161,7 +179,7 @@ class HueColorWheelCard extends HTMLElement {
 
   connectedCallback() {
     window.addEventListener("pagehide", this._flushHandler);
-    window.addEventListener("visibilitychange", this._flushHandler);
+    document.addEventListener("visibilitychange", this._visibilityHandler);
     this._maybeBuild();
   }
 
@@ -177,7 +195,7 @@ class HueColorWheelCard extends HTMLElement {
     this._pendingCalls.clear();
     clearTimeout(this._animTimer);
     window.removeEventListener("pagehide", this._flushHandler);
-    window.removeEventListener("visibilitychange", this._flushHandler);
+    document.removeEventListener("visibilitychange", this._visibilityHandler);
     if (this._pendingSave) this._syncRemote(); // flush remote before teardown
     this._built = false;
   }
@@ -1135,16 +1153,7 @@ class HueColorWheelCard extends HTMLElement {
     return `hue-color-wheel-card:store:${this._entityKey()}`;
   }
 
-  async _loadStore() {
-    try {
-      const resp = await this._hass.callWS({
-        type: "frontend/get_user_data",
-        key: this._storeKey(),
-      });
-      if (resp && resp.value) return resp.value;
-    } catch (e) {
-      // older HA or WS hiccup: fall back to this browser's storage
-    }
+  _readLocal() {
     try {
       const local = JSON.parse(localStorage.getItem(this._localKey()));
       if (local) return local;
@@ -1156,47 +1165,93 @@ class HueColorWheelCard extends HTMLElement {
       const legacy = JSON.parse(
         localStorage.getItem(`hue-color-wheel-card:presets:${this._entityKey()}`)
       );
-      if (legacy) return { presets: legacy };
+      if (legacy) return { presets: legacy, updatedAt: 1 };
     } catch (e) {
       /* ignore */
     }
     return null;
   }
 
-  async _restoreStore() {
-    // block saves while loading so live hass updates can't clobber stored
-    // state on the localStorage fallback path before we've read it back
-    this._restoring = true;
-    let data;
+  async _readRemote() {
     try {
-      data = await this._loadStore();
+      const resp = await this._hass.callWS({
+        type: "frontend/get_user_data",
+        key: this._storeKey(),
+      });
+      if (resp && resp.value) return resp.value;
+    } catch (e) {
+      // older HA or transient WS error; caller falls back to local
+    }
+    return null;
+  }
+
+  /**
+   * Initial load on card build. Paint instantly from the local cache, then
+   * reconcile with the server (the shared source of truth across devices).
+   */
+  async _restoreStore() {
+    this._restoring = true;
+    try {
+      const local = this._readLocal();
+      if (local) this._applyStore(local);
+      const remote = await this._readRemote();
+      if (remote && (remote.updatedAt || 0) >= (local?.updatedAt || 0)) {
+        this._applyStore(remote);
+        this._writeLocal(remote); // refresh cache with the authoritative copy
+      } else if (local && !remote) {
+        // server has nothing yet — seed it from this device
+        this._storeUpdatedAt = local.updatedAt || 0;
+        this._writeRemote(local);
+      }
     } finally {
       this._restoring = false;
     }
-    if (!data || !this._built) return;
+    if (this._built) this._updateAll();
+  }
+
+  /**
+   * Re-fetch the shared state from the server and apply it if it is newer
+   * than what we last applied. Called when the page/app returns to the
+   * foreground and when the WebSocket reconnects.
+   */
+  async _syncFromServer() {
+    if (!this._hass || !this._built || this._drag) return;
+    const remote = await this._readRemote();
+    if (!remote) return;
+    if ((remote.updatedAt || 0) > this._storeUpdatedAt) {
+      this._applyStore(remote);
+      this._writeLocal(remote);
+      if (this._built) this._updateAll();
+    }
+  }
+
+  /** Apply a loaded store object to card state (does not persist). */
+  _applyStore(data) {
+    if (!data) return;
+    this._storeUpdatedAt = Math.max(this._storeUpdatedAt, data.updatedAt || 0);
     if (data.presets && typeof data.presets === "object") {
       this._presets = data.presets;
       this._renderPresets();
     }
+    // For lights that are ON, live hass state is authoritative for their
+    // color/brightness; stored values only fill in lights that are off.
     if (data.lastHs) {
       for (const [entity, hs] of Object.entries(data.lastHs)) {
-        // live state wins; restored values fill in lights that are off now
-        if (this._pins.has(entity) && !this._lastHs.has(entity) && Array.isArray(hs)) {
-          this._lastHs.set(entity, hs.slice(0, 2));
-        }
+        if (!this._pins.has(entity) || !Array.isArray(hs)) continue;
+        if (this._hass?.states[entity]?.state === "on") continue;
+        this._lastHs.set(entity, hs.slice(0, 2));
       }
     }
     if (data.lastBrightness) {
       for (const [entity, pct] of Object.entries(data.lastBrightness)) {
-        if (this._pins.has(entity) && !this._lastBrightness.has(entity)) {
-          this._lastBrightness.set(entity, pct);
-        }
+        if (!this._pins.has(entity)) continue;
+        if (this._hass?.states[entity]?.state === "on") continue;
+        this._lastBrightness.set(entity, pct);
       }
     }
     if (Array.isArray(data.clusters)) {
-      // restored stacks are re-validated by the stray check: members whose
-      // live color moved away since last session pop back out on their own.
-      // A settle window covers the burst of state echoes right after load.
+      // stacks are re-validated by the stray check; a settle window covers
+      // the burst of state echoes right after applying them
       this._clusters = data.clusters
         .map((c) => ({
           members: (c.members || []).filter((id) => this._pins.has(id)),
@@ -1204,13 +1259,15 @@ class HueColorWheelCard extends HTMLElement {
           settleUntil: Date.now() + CLUSTER_SETTLE_MS,
         }))
         .filter((c) => c.members.length >= 2 && c.hs);
+      this._selectedCluster = null;
+      this._refreshClusterStyles?.();
     }
-    this._updateAll();
   }
 
   _buildStoreValue() {
     return {
       v: 1,
+      updatedAt: Date.now(),
       clusters: this._clusters.map((c) => ({ members: [...c.members], hs: c.hs })),
       lastHs: Object.fromEntries(this._lastHs),
       lastBrightness: Object.fromEntries(this._lastBrightness),
@@ -1218,32 +1275,53 @@ class HueColorWheelCard extends HTMLElement {
     };
   }
 
-  /**
-   * Persist immediately to localStorage (synchronous, survives a refresh or
-   * app close at any moment) and debounce the per-user server sync that
-   * carries state to other browsers/devices.
-   */
-  _scheduleSave() {
-    if (!this._lights || this._restoring) return;
-    const value = (this._pendingSave = this._buildStoreValue());
+  _writeLocal(value) {
     try {
       localStorage.setItem(this._localKey(), JSON.stringify(value));
     } catch (e) {
       /* storage full or unavailable */
     }
+  }
+
+  _writeRemote(value) {
+    if (!this._hass) return;
+    this._hass
+      .callWS({ type: "frontend/set_user_data", key: this._storeKey(), value })
+      .catch((err) => {
+        if (!this._warnedWrite) {
+          this._warnedWrite = true;
+          console.warn(
+            "hue-color-wheel-card: could not save state to Home Assistant " +
+              "(frontend/set_user_data failed); cross-device sync disabled, " +
+              "falling back to this browser only.",
+            err
+          );
+        }
+      });
+  }
+
+  /**
+   * Persist on every change: write the local cache synchronously (survives a
+   * refresh/app close at any instant) and debounce the per-user server sync
+   * that carries state to other browsers/devices. Each save stamps updatedAt
+   * so devices reconcile newest-wins.
+   */
+  _scheduleSave() {
+    if (!this._lights || this._restoring) return;
+    const value = (this._pendingSave = this._buildStoreValue());
+    this._storeUpdatedAt = value.updatedAt;
+    this._writeLocal(value);
     clearTimeout(this._saveTimer);
-    this._saveTimer = setTimeout(() => this._syncRemote(), 1500);
+    this._saveTimer = setTimeout(() => this._syncRemote(), 1200);
   }
 
   _syncRemote() {
     clearTimeout(this._saveTimer);
     this._saveTimer = null;
     const value = this._pendingSave;
-    if (!value || !this._hass) return;
+    if (!value) return;
     this._pendingSave = null;
-    this._hass
-      .callWS({ type: "frontend/set_user_data", key: this._storeKey(), value })
-      .catch(() => {});
+    this._writeRemote(value);
   }
 
   /* ------------------------------------------------------------ presets */

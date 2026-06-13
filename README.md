@@ -141,12 +141,24 @@ Either `lights` or `auto_entities` is required.
   HA scene; presets here are meant for quick dashboard recall.
 - During a group drag, the per-light call throttle widens with the group
   size so the total WebSocket call rate stays roughly constant.
-- **Persistence**: merged stacks, presets, and each light's last-known
-  color and brightness are saved to Home Assistant's per-user frontend
-  storage, so they survive reloads and follow you across pages, browsers,
-  and devices (per HA user). The browser's `localStorage` is kept in sync
-  as a fallback for older HA versions, and presets saved by pre-0.4
-  versions of the card are migrated automatically.
+- **Persistence & cross-device sync**: the actual light colors, brightness,
+  and on/off states are stored and synced by Home Assistant itself — every
+  device reads the same live `hass.states`, so those are always consistent.
+  The card's own metadata (merged stacks, presets, and last-known positions
+  for *off* lights) is saved to Home Assistant's per-user frontend storage
+  (`frontend/set_user_data`) — the same server-side, per-user store the HA
+  frontend uses for things like sidebar order. This is the shared source of
+  truth across all your devices (logged in as the same HA user).
+  - Every change writes a local cache immediately (so it survives a refresh
+    or app close at any instant) and pushes to the server, stamped with a
+    timestamp.
+  - The card re-pulls the latest server state when the page/app returns to
+    the foreground and whenever the WebSocket reconnects, so a change made
+    on one device shows up on the others. Conflicts resolve newest-wins.
+  - If the server write ever fails (e.g. a much older HA version without the
+    user-data API), the card logs a one-time console warning and keeps
+    working from the local cache (that device just won't sync).
+  - Presets saved by pre-0.4 versions of the card are migrated automatically.
 - A stack dissolves on its own if a member turns off or something
   external (automation, Hue app) moves a member's color visibly away
   from the stack. Tap a stack once to control its brightness as a group;
