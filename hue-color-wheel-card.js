@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.4.2";
+const CARD_VERSION = "0.4.3";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -750,35 +750,49 @@ class HueColorWheelCard extends HTMLElement {
       startXy.set(id, hsToXy(hs[0], hs[1], this._radius));
     }
 
-    // Mobile / iOS Safari shadow-DOM note: setPointerCapture and listeners
-    // attached to the pin element do not reliably deliver pointermove once
-    // the finger leaves the pin's bounds (especially inside a custom
-    // element). Attaching the drag listeners to window — and passing
-    // { passive: false } so we can suppress page scroll — is the robust
-    // pattern that works across desktop, iOS Safari, and the HA Companion
-    // app's webview.
+    // Mobile reliability: we use BOTH pointer capture and window-level
+    // listeners.
+    //   - setPointerCapture keeps the gesture owned by the pin and stops the
+    //     browser from re-hit-testing each move and hijacking it into a page
+    //     scroll once the finger leaves the wheel (which fires pointercancel
+    //     and silently kills the drag — the main mobile bug).
+    //   - window listeners guarantee we still hear pointermove/up even if
+    //     capture delivery to a shadow-DOM child is flaky on iOS Safari.
+    // Captured events still bubble to window, so the handler runs once.
+    try {
+      pin.el.setPointerCapture(ev.pointerId);
+    } catch (e) {
+      /* capture unsupported/failed; window listeners still cover us */
+    }
+
     const onMove = (e) => {
       if (!this._drag || e.pointerId !== this._drag.pointerId) return;
-      e.preventDefault();
+      if (e.cancelable) e.preventDefault();
       this._onPinMove(e, entity);
     };
-    const onUp = (e) => {
+    const onEnd = (e) => {
       if (!this._drag || e.pointerId !== this._drag.pointerId) return;
+      // A pointercancel with no movement is an ambiguous interruption — drop
+      // it silently rather than firing a tap (which could toggle selection
+      // or split a cluster). A pointercancel AFTER real movement commits the
+      // last dragged position: on mobile pointercancel can fire spuriously,
+      // and aborting a real drag would make it feel random.
+      if (e.type === "pointercancel" && !this._drag.moved) {
+        this._abortDrag();
+        return;
+      }
       cleanup();
       this._onPinUp(e, entity);
     };
-    const onCancel = (e) => {
-      if (!this._drag || e.pointerId !== this._drag.pointerId) return;
-      cleanup();
-      // OS cancelled the gesture (system swipe, palm rejection, scroll
-      // hijack) — discard the in-flight drag instead of committing a
-      // partial position
-      this._abortDrag();
-    };
     const cleanup = () => {
-      window.removeEventListener("pointermove", onMove, { passive: false });
-      window.removeEventListener("pointerup", onUp);
-      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
+      try {
+        pin.el.releasePointerCapture(ev.pointerId);
+      } catch (e) {
+        /* already released */
+      }
     };
 
     this._drag = {
@@ -795,13 +809,14 @@ class HueColorWheelCard extends HTMLElement {
     };
 
     window.addEventListener("pointermove", onMove, { passive: false });
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("pointercancel", onEnd);
   }
 
   _abortDrag() {
     const drag = this._drag;
     if (!drag) return;
+    if (drag.cleanup) drag.cleanup();
     this._drag = null;
     for (const id of drag.members) {
       this._pins.get(id)?.el.classList.remove("dragging");
