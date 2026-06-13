@@ -16,6 +16,7 @@ const DEFAULTS = {
   wheel_size: 300,
   show_brightness: true,
   show_labels: true,
+  show_presets: true,
   pin_size: 36,
 };
 
@@ -92,7 +93,8 @@ class HueColorWheelCard extends HTMLElement {
     this._lights = null; // resolved [{entity, label}]
     this._pins = new Map(); // entity -> {el, circle, label}
     this._lastHs = new Map(); // entity -> [h, s] last seen while on
-    this._selected = null; // entity selected for brightness, null = all
+    this._multi = new Set(); // entities selected for group drag / brightness
+    this._presets = {}; // preset name -> per-entity snapshot
     this._drag = null;
     this._radius = 0;
     this._pendingCalls = new Map(); // entity -> {timer, lastSent, pending}
@@ -137,6 +139,7 @@ class HueColorWheelCard extends HTMLElement {
     }
     for (const p of this._pendingCalls.values()) clearTimeout(p.timer);
     this._pendingCalls.clear();
+    clearTimeout(this._animTimer);
     this._built = false;
   }
 
@@ -266,6 +269,8 @@ class HueColorWheelCard extends HTMLElement {
           transition: background-color 0.3s ease;
         }
         .pin.dragging .pin-circle { transition: none; }
+        .pin.animating { transition: transform 0.7s cubic-bezier(0.25, 0.8, 0.3, 1); }
+        .pin.animating .pin-circle { transition: background-color 0.7s ease; }
         .pin-label {
           position: absolute;
           top: ${hit / 2 + pinSize / 2 + 2}px;
@@ -333,6 +338,49 @@ class HueColorWheelCard extends HTMLElement {
           background: #fff;
           box-shadow: 0 1px 4px rgba(0,0,0,0.5);
         }
+        .presets {
+          display: ${cfg.show_presets ? "flex" : "none"};
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 8px;
+          margin-top: 14px;
+        }
+        .chip, .save-btn, .save-ok, .save-cancel {
+          font: inherit;
+          font-size: 13px;
+          color: var(--primary-text-color, #e1e1e1);
+          background: rgba(255,255,255,0.08);
+          border: 1px solid rgba(255,255,255,0.15);
+          border-radius: 16px;
+          padding: 6px 12px;
+          cursor: pointer;
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          min-height: 32px;
+          box-sizing: border-box;
+        }
+        .chip:hover, .save-btn:hover { background: rgba(255,255,255,0.16); }
+        .chip-del {
+          opacity: 0.6;
+          font-size: 14px;
+          line-height: 1;
+          padding: 2px;
+        }
+        .chip-del:hover { opacity: 1; }
+        .save-form { display: inline-flex; align-items: center; gap: 6px; }
+        .save-form[hidden] { display: none; }
+        .save-form input {
+          font: inherit;
+          font-size: 13px;
+          color: var(--primary-text-color, #e1e1e1);
+          background: rgba(255,255,255,0.08);
+          border: 1px solid rgba(255,255,255,0.25);
+          border-radius: 8px;
+          padding: 6px 10px;
+          width: 130px;
+          outline: none;
+        }
         .ct-note {
           margin-top: 12px;
           font-size: 12px;
@@ -348,6 +396,15 @@ class HueColorWheelCard extends HTMLElement {
           <span class="brightness-label">All lights</span>
           <input type="range" min="1" max="100" value="100" aria-label="Brightness">
         </div>
+        <div class="presets">
+          <span class="chips"></span>
+          <button class="save-btn">+ Save preset</button>
+          <span class="save-form" hidden>
+            <input type="text" maxlength="24" placeholder="Preset name" aria-label="Preset name">
+            <button class="save-ok">Save</button>
+            <button class="save-cancel">✕</button>
+          </span>
+        </div>
         <div class="ct-note" hidden></div>
       </ha-card>
     `;
@@ -359,10 +416,40 @@ class HueColorWheelCard extends HTMLElement {
     this._slider = this.shadowRoot.querySelector('input[type="range"]');
     this._ctNote = this.shadowRoot.querySelector(".ct-note");
 
+    this._chipsEl = this.shadowRoot.querySelector(".chips");
+    this._saveBtn = this.shadowRoot.querySelector(".save-btn");
+    this._saveForm = this.shadowRoot.querySelector(".save-form");
+    this._saveInput = this.shadowRoot.querySelector(".save-form input");
+
     this._slider.addEventListener("input", () => this._onBrightnessInput());
     this._wheelWrap.addEventListener("pointerdown", (ev) => {
-      // tap on empty wheel area deselects
-      if (ev.target === this._canvas) this._select(null);
+      // tap on empty wheel area clears the selection
+      if (ev.target === this._canvas) {
+        this._multi.clear();
+        this._refreshSelection();
+      }
+    });
+
+    this._saveBtn.addEventListener("click", () => {
+      this._saveBtn.hidden = true;
+      this._saveForm.hidden = false;
+      this._saveInput.value = "";
+      this._saveInput.focus();
+    });
+    const closeSaveForm = () => {
+      this._saveForm.hidden = true;
+      this._saveBtn.hidden = false;
+    };
+    this.shadowRoot.querySelector(".save-cancel").addEventListener("click", closeSaveForm);
+    const commitSave = () => {
+      const name = this._saveInput.value.trim();
+      if (name) this._capturePreset(name);
+      closeSaveForm();
+    };
+    this.shadowRoot.querySelector(".save-ok").addEventListener("click", commitSave);
+    this._saveInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") commitSave();
+      if (ev.key === "Escape") closeSaveForm();
     });
 
     this._pins.clear();
@@ -383,6 +470,9 @@ class HueColorWheelCard extends HTMLElement {
       this._pinsEl.appendChild(pin);
       this._pins.set(light.entity, { el: pin, circle, label, cfg: light });
     }
+
+    this._presets = this._loadPresets();
+    this._renderPresets();
 
     this._resizeObserver = new ResizeObserver(() => this._onResize());
     this._resizeObserver.observe(this._wheelWrap);
@@ -459,7 +549,7 @@ class HueColorWheelCard extends HTMLElement {
   }
 
   _updatePin(entity, pin, stateObj) {
-    const dragging = this._drag && this._drag.entity === entity;
+    const dragging = this._drag && this._drag.members.has(entity);
     const exists = !!stateObj;
     const unavailable = !exists || stateObj.state === "unavailable" || stateObj.state === "unknown";
     const isOn = exists && stateObj.state === "on";
@@ -471,7 +561,7 @@ class HueColorWheelCard extends HTMLElement {
 
     pin.el.classList.toggle("unavailable", unavailable);
     pin.el.classList.toggle("off", !unavailable && !isOn);
-    pin.el.classList.toggle("selected", this._selected === entity);
+    pin.el.classList.toggle("selected", this._multi.has(entity));
 
     if (isOn && Array.isArray(stateObj.attributes.hs_color)) {
       this._lastHs.set(entity, stateObj.attributes.hs_color.slice(0, 2));
@@ -503,7 +593,7 @@ class HueColorWheelCard extends HTMLElement {
 
   _positionAllPins() {
     for (const [entity, pin] of this._pins) {
-      if (this._drag && this._drag.entity === entity) continue;
+      if (this._drag && this._drag.members.has(entity)) continue;
       const hs = this._lastHs.get(entity) || [0, 0];
       this._positionPin(pin, hs);
     }
@@ -518,13 +608,31 @@ class HueColorWheelCard extends HTMLElement {
     ev.stopPropagation();
     pin.el.setPointerCapture(ev.pointerId);
 
+    // dragging a selected pin moves the whole selection together
+    const group =
+      this._multi.has(entity) && this._multi.size > 1
+        ? [...this._multi].filter(
+            (id) => !this._pins.get(id)?.el.classList.contains("unavailable")
+          )
+        : [entity];
+
+    // each member's wheel position at drag start; the pointer delta is
+    // applied to all of them so the group keeps its relative arrangement
+    const startXy = new Map();
+    for (const id of group) {
+      const hs = this._lastHs.get(id) || [0, 0];
+      startXy.set(id, hsToXy(hs[0], hs[1], this._radius));
+    }
+
     this._drag = {
       entity,
+      members: new Set(group),
+      startXy,
       pointerId: ev.pointerId,
       startX: ev.clientX,
       startY: ev.clientY,
       moved: false,
-      lastHs: null,
+      lastHs: new Map(),
     };
 
     const onMove = (e) => this._onPinMove(e, entity);
@@ -542,36 +650,50 @@ class HueColorWheelCard extends HTMLElement {
   _onPinMove(ev, entity) {
     const drag = this._drag;
     if (!drag || drag.entity !== entity || ev.pointerId !== drag.pointerId) return;
+    const dxp = ev.clientX - drag.startX;
+    const dyp = ev.clientY - drag.startY;
     if (!drag.moved) {
-      const dx = ev.clientX - drag.startX;
-      const dy = ev.clientY - drag.startY;
-      if (Math.sqrt(dx * dx + dy * dy) < TAP_SLOP_PX) return;
+      if (Math.sqrt(dxp * dxp + dyp * dyp) < TAP_SLOP_PX) return;
       drag.moved = true;
-      this._pins.get(entity).el.classList.add("dragging");
+      for (const id of drag.members) {
+        this._pins.get(id).el.classList.add("dragging");
+      }
     }
-    const hs = this._eventToHs(ev);
-    drag.lastHs = hs;
-    const pin = this._pins.get(entity);
-    this._positionPin(pin, hs);
-    pin.circle.style.background = rgbCss(hsv2rgb(hs[0], hs[1] / 100, 1));
-    pin.el.classList.remove("off");
-    this._throttledColorCall(entity, hs);
+    const r = this._radius;
+    for (const id of drag.members) {
+      const [sx, sy] = drag.startXy.get(id);
+      let x = sx + dxp;
+      let y = sy + dyp;
+      const dist = Math.sqrt(x * x + y * y);
+      if (dist > r && dist > 0) {
+        x *= r / dist;
+        y *= r / dist;
+      }
+      const hs = xyToHs(x, y, r);
+      drag.lastHs.set(id, hs);
+      const p = this._pins.get(id);
+      p.el.style.transform = `translate(${r + x}px, ${r + y}px)`;
+      p.circle.style.background = rgbCss(hsv2rgb(hs[0], hs[1] / 100, 1));
+      p.el.classList.remove("off");
+      this._throttledColorCall(id, hs);
+    }
   }
 
   _onPinUp(ev, entity) {
     const drag = this._drag;
     if (!drag || drag.entity !== entity) return;
     this._drag = null;
-    const pin = this._pins.get(entity);
-    pin.el.classList.remove("dragging");
+    for (const id of drag.members) {
+      this._pins.get(id).el.classList.remove("dragging");
+    }
 
     if (!drag.moved) {
       this._onPinTap(entity);
       return;
     }
-    if (drag.lastHs) {
-      this._lastHs.set(entity, drag.lastHs);
-      this._sendColor(entity, drag.lastHs); // final, authoritative call
+    for (const [id, hs] of drag.lastHs) {
+      this._lastHs.set(id, hs);
+      this._sendColor(id, hs); // final, authoritative call
     }
   }
 
@@ -581,23 +703,17 @@ class HueColorWheelCard extends HTMLElement {
       this._hass.callService("light", "turn_on", { entity_id: entity });
       return;
     }
-    this._select(this._selected === entity ? null : entity);
+    // tap toggles membership in the multi-selection
+    if (this._multi.has(entity)) this._multi.delete(entity);
+    else this._multi.add(entity);
+    this._refreshSelection();
   }
 
-  _select(entity) {
-    this._selected = entity;
+  _refreshSelection() {
     for (const [id, pin] of this._pins) {
-      pin.el.classList.toggle("selected", id === entity);
+      pin.el.classList.toggle("selected", this._multi.has(id));
     }
     this._updateBrightnessUi();
-  }
-
-  _eventToHs(ev) {
-    const rect = this._wheelWrap.getBoundingClientRect();
-    const r = rect.width / 2;
-    const dx = ev.clientX - (rect.left + r);
-    const dy = ev.clientY - (rect.top + r);
-    return xyToHs(dx, dy, r);
   }
 
   /* ------------------------------------------------------------ service calls */
@@ -612,7 +728,11 @@ class HueColorWheelCard extends HTMLElement {
       slot.pending = hs; // trailing value, sent when the timer fires
       return;
     }
-    this._sendColor(entity, hs, false);
+    this._sendColor(entity, hs);
+    // widen the per-light interval for group drags so the total call
+    // rate across the group stays in the same ballpark
+    const groupSize = this._drag ? this._drag.members.size : 1;
+    const interval = Math.min(SERVICE_THROTTLE_MS * Math.max(groupSize, 1), 500);
     slot.timer = setTimeout(() => {
       slot.timer = null;
       if (slot.pending) {
@@ -620,7 +740,7 @@ class HueColorWheelCard extends HTMLElement {
         slot.pending = null;
         this._throttledColorCall(entity, p);
       }
-    }, SERVICE_THROTTLE_MS);
+    }, interval);
   }
 
   _sendColor(entity, hs) {
@@ -630,21 +750,123 @@ class HueColorWheelCard extends HTMLElement {
     });
   }
 
+  /* ------------------------------------------------------------ presets */
+
+  _storageKey() {
+    const ids = this._lights.map((l) => l.entity).sort().join(",");
+    return `hue-color-wheel-card:presets:${ids}`;
+  }
+
+  _loadPresets() {
+    try {
+      return JSON.parse(localStorage.getItem(this._storageKey())) || {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  _persistPresets() {
+    try {
+      localStorage.setItem(this._storageKey(), JSON.stringify(this._presets));
+    } catch (e) {
+      // storage full or unavailable; preset still works for this session
+    }
+  }
+
+  _capturePreset(name) {
+    const snapshot = {};
+    for (const entity of this._pins.keys()) {
+      const s = this._hass.states[entity];
+      if (!s || s.state === "unavailable" || s.state === "unknown") continue;
+      const hs = this._lastHs.get(entity) || s.attributes.hs_color || [0, 0];
+      snapshot[entity] = {
+        on: s.state === "on",
+        hs: [hs[0], hs[1]],
+        brightness_pct:
+          s.attributes.brightness != null
+            ? Math.round((s.attributes.brightness / 255) * 100)
+            : null,
+      };
+    }
+    this._presets[name] = snapshot;
+    this._persistPresets();
+    this._renderPresets();
+  }
+
+  _deletePreset(name) {
+    delete this._presets[name];
+    this._persistPresets();
+    this._renderPresets();
+  }
+
+  _applyPreset(name) {
+    const snapshot = this._presets[name];
+    if (!snapshot) return;
+    for (const [entity, saved] of Object.entries(snapshot)) {
+      const pin = this._pins.get(entity);
+      if (!pin || pin.el.classList.contains("unavailable")) continue;
+      if (saved.on) {
+        // move the pin optimistically with a slow ease; the subsequent
+        // hass updates land on the same position, so no snap-back
+        pin.el.classList.add("animating");
+        pin.el.classList.remove("off");
+        this._lastHs.set(entity, saved.hs);
+        this._positionPin(pin, saved.hs);
+        pin.circle.style.background = rgbCss(hsv2rgb(saved.hs[0], saved.hs[1] / 100, 1));
+        const data = { entity_id: entity, hs_color: saved.hs };
+        if (saved.brightness_pct != null) data.brightness_pct = saved.brightness_pct;
+        this._hass.callService("light", "turn_on", data);
+      } else {
+        this._hass.callService("light", "turn_off", { entity_id: entity });
+      }
+    }
+    clearTimeout(this._animTimer);
+    this._animTimer = setTimeout(() => {
+      for (const pin of this._pins.values()) pin.el.classList.remove("animating");
+    }, 800);
+  }
+
+  _renderPresets() {
+    if (!this._chipsEl) return;
+    this._chipsEl.textContent = "";
+    for (const name of Object.keys(this._presets)) {
+      const chip = document.createElement("button");
+      chip.className = "chip";
+      chip.title = `Activate "${name}"`;
+      const text = document.createElement("span");
+      text.textContent = name;
+      const del = document.createElement("span");
+      del.className = "chip-del";
+      del.textContent = "✕";
+      del.title = `Delete "${name}"`;
+      chip.append(text, del);
+      chip.addEventListener("click", (ev) => {
+        if (ev.target === del) this._deletePreset(name);
+        else this._applyPreset(name);
+      });
+      this._chipsEl.appendChild(chip);
+    }
+  }
+
   /* ------------------------------------------------------------ brightness */
 
   _updateBrightnessUi() {
     if (!this._config.show_brightness || this._sliderActive) return;
-    if (this._selected) {
-      const stateObj = this._hass.states[this._selected];
-      const pin = this._pins.get(this._selected);
+    if (this._multi.size === 1) {
+      const entity = [...this._multi][0];
+      const stateObj = this._hass.states[entity];
+      const pin = this._pins.get(entity);
       this._brightnessLabel.textContent =
-        pin?.cfg.label || stateObj?.attributes.friendly_name || this._selected;
+        pin?.cfg.label || stateObj?.attributes.friendly_name || entity;
       const b = stateObj?.attributes.brightness;
       this._slider.value = b != null ? Math.max(1, Math.round((b / 255) * 100)) : 100;
     } else {
-      this._brightnessLabel.textContent = "All lights";
+      const targets = this._multi.size ? [...this._multi] : [...this._pins.keys()];
+      this._brightnessLabel.textContent = this._multi.size
+        ? `${this._multi.size} lights`
+        : "All lights";
       const vals = [];
-      for (const entity of this._pins.keys()) {
+      for (const entity of targets) {
         const s = this._hass.states[entity];
         if (s?.state === "on" && s.attributes.brightness != null) {
           vals.push((s.attributes.brightness / 255) * 100);
@@ -674,9 +896,9 @@ class HueColorWheelCard extends HTMLElement {
 
   _sendBrightness(pct) {
     this._lastBrightnessCall = Date.now();
-    if (this._selected) {
+    if (this._multi.size) {
       this._hass.callService("light", "turn_on", {
-        entity_id: this._selected,
+        entity_id: [...this._multi],
         brightness_pct: pct,
       });
       return;
