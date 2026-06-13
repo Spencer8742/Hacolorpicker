@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.3.0";
+const CARD_VERSION = "0.3.1";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -98,6 +98,7 @@ class HueColorWheelCard extends HTMLElement {
     this._pins = new Map(); // entity -> {el, circle, label}
     this._lastHs = new Map(); // entity -> [h, s] last seen while on
     this._multi = new Set(); // entities selected for group drag / brightness
+    this._selectedCluster = null; // cluster selected for brightness (first tap)
     this._clusters = []; // merged pin stacks: {members: [entity...], hs}
     this._clusterDirty = false;
     this._presets = {}; // preset name -> per-entity snapshot
@@ -461,6 +462,7 @@ class HueColorWheelCard extends HTMLElement {
       // tap on empty wheel area clears the selection
       if (ev.target === this._canvas) {
         this._multi.clear();
+        this._selectedCluster = null;
         this._refreshSelection();
       }
     });
@@ -808,10 +810,22 @@ class HueColorWheelCard extends HTMLElement {
   _onPinTap(entity) {
     const cluster = this._clusterFor(entity);
     if (cluster) {
-      // tapping a stacked pin fans its lights back out
-      this._splitCluster(cluster);
+      if (this._selectedCluster === cluster) {
+        // second tap on the same stack: split it
+        this._selectedCluster = null;
+        this._multi.clear();
+        this._refreshSelection();
+        this._splitCluster(cluster);
+      } else {
+        // first tap: select all cluster members for brightness control
+        this._selectedCluster = cluster;
+        this._multi = new Set(cluster.members);
+        this._refreshSelection();
+      }
       return;
     }
+    // tapping a non-cluster pin clears any cluster selection
+    this._selectedCluster = null;
     const stateObj = this._hass.states[entity];
     if (stateObj && stateObj.state === "off") {
       this._hass.callService("light", "turn_on", { entity_id: entity });
@@ -1025,6 +1039,8 @@ class HueColorWheelCard extends HTMLElement {
     if (!snapshot) return;
     // presets recall exact per-light positions, so dissolve any stacks
     this._clusters = [];
+    this._selectedCluster = null;
+    this._multi.clear();
     this._refreshClusterStyles();
     for (const [entity, saved] of Object.entries(snapshot)) {
       const pin = this._pins.get(entity);
@@ -1076,30 +1092,56 @@ class HueColorWheelCard extends HTMLElement {
 
   _updateBrightnessUi() {
     if (!this._config.show_brightness || this._sliderActive) return;
-    if (this._multi.size === 1) {
-      const entity = [...this._multi][0];
+    const targets = this._brightnessTargets();
+    if (targets.size === 0) {
+      this._brightnessLabel.textContent = "All lights";
+    } else if (targets.size === 1) {
+      const entity = [...targets][0];
       const stateObj = this._hass.states[entity];
       const pin = this._pins.get(entity);
       this._brightnessLabel.textContent =
         pin?.cfg.label || stateObj?.attributes.friendly_name || entity;
       const b = stateObj?.attributes.brightness;
       this._slider.value = b != null ? Math.max(1, Math.round((b / 255) * 100)) : 100;
+      return;
+    } else if (this._selectedCluster) {
+      this._brightnessLabel.textContent = `Group (${targets.size} lights)`;
     } else {
-      const targets = this._multi.size ? [...this._multi] : [...this._pins.keys()];
-      this._brightnessLabel.textContent = this._multi.size
-        ? `${this._multi.size} lights`
-        : "All lights";
-      const vals = [];
-      for (const entity of targets) {
+      this._brightnessLabel.textContent = `${targets.size} lights`;
+    }
+    const vals = [];
+    for (const entity of targets) {
+      const s = this._hass.states[entity];
+      if (s?.state === "on" && s.attributes.brightness != null) {
+        vals.push((s.attributes.brightness / 255) * 100);
+      }
+    }
+    if (!vals.length) {
+      // fall back to all on-lights when nothing useful in selection
+      for (const entity of this._pins.keys()) {
         const s = this._hass.states[entity];
         if (s?.state === "on" && s.attributes.brightness != null) {
           vals.push((s.attributes.brightness / 255) * 100);
         }
       }
-      if (vals.length) {
-        this._slider.value = Math.max(1, Math.round(vals.reduce((a, b) => a + b, 0) / vals.length));
-      }
     }
+    if (vals.length) {
+      this._slider.value = Math.max(1, Math.round(vals.reduce((a, b) => a + b, 0) / vals.length));
+    }
+  }
+
+  /** Expanded set of entity IDs the brightness slider should target. */
+  _brightnessTargets() {
+    if (!this._multi.size) return new Set(); // means "all on lights"
+    // expand through clusters so stacked members are included even if only
+    // the representative pin is in _multi
+    const result = new Set();
+    for (const id of this._multi) {
+      const cluster = this._clusterFor(id);
+      if (cluster) cluster.members.forEach((m) => result.add(m));
+      else result.add(id);
+    }
+    return result;
   }
 
   _onBrightnessInput() {
@@ -1120,20 +1162,21 @@ class HueColorWheelCard extends HTMLElement {
 
   _sendBrightness(pct) {
     this._lastBrightnessCall = Date.now();
-    if (this._multi.size) {
+    const targets = this._brightnessTargets();
+    if (targets.size) {
       this._hass.callService("light", "turn_on", {
-        entity_id: [...this._multi],
+        entity_id: [...targets],
         brightness_pct: pct,
       });
       return;
     }
     // global: only adjust lights that are currently on
-    const targets = [...this._pins.keys()].filter(
+    const onLights = [...this._pins.keys()].filter(
       (e) => this._hass.states[e]?.state === "on"
     );
-    if (targets.length) {
+    if (onLights.length) {
       this._hass.callService("light", "turn_on", {
-        entity_id: targets,
+        entity_id: onLights,
         brightness_pct: pct,
       });
     }
