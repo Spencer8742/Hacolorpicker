@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.4.3";
+const CARD_VERSION = "0.4.4";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -28,6 +28,11 @@ const SERVICE_THROTTLE_MS = 150; // ~6-7 calls/sec max while dragging
 // generous tap slop accounts for finger jitter on mobile — a strict 6px
 // threshold causes touch taps to occasionally register as drags
 const TAP_SLOP_PX = 10;
+// After a stack's color is authoritatively set (merge or drag release), the
+// bulbs lag and Home Assistant streams back stale mid-drag state echoes.
+// We ignore stray detection during this window so those echoes can't
+// dissolve the stack. Tuned for slow bulbs like Hue.
+const CLUSTER_SETTLE_MS = 3000;
 
 const COLOR_MODES_WHEEL = ["hs", "xy", "rgb", "rgbw", "rgbww"];
 
@@ -657,15 +662,20 @@ class HueColorWheelCard extends HTMLElement {
     }
 
     // a member leaves its cluster when it turns off or when something
-    // external moves its color visibly away from the stack
+    // external moves its color visibly away from the stack. We skip this
+    // while the stack is still settling, otherwise stale state echoes from a
+    // fast drag (bulbs catching up) would scatter the group right after you
+    // let go. Straying also uses a larger threshold than merging
+    // (hysteresis) so per-bulb color quantization at rest can't trip it.
     let cluster = this._clusterFor(entity);
-    if (cluster && !dragging) {
+    const settling = cluster && cluster.settleUntil && Date.now() < cluster.settleUntil;
+    if (cluster && !dragging && !settling) {
       const cur = this._lastHs.get(entity);
       let strayed = !unavailable && !isOn;
       if (!strayed && isOn && cur && this._radius > 0) {
         const a = hsToXy(cur[0], cur[1], this._radius);
         const b = hsToXy(cluster.hs[0], cluster.hs[1], this._radius);
-        strayed = Math.hypot(a[0] - b[0], a[1] - b[1]) > this._mergeDistance();
+        strayed = Math.hypot(a[0] - b[0], a[1] - b[1]) > this._strayDistance();
       }
       if (strayed) {
         this._removeFromCluster(entity);
@@ -902,11 +912,13 @@ class HueColorWheelCard extends HTMLElement {
       this._lastHs.set(id, hs);
       this._sendColor(id, hs); // final, authoritative call
     }
-    // clusters dragged as a whole keep their stacked position
+    // clusters dragged as a whole keep their stacked position; restart the
+    // settle window so stale echoes from this drag can't dissolve them
     for (const cluster of this._clusters) {
       if (cluster.members.every((m) => drag.members.has(m))) {
         const hs = drag.lastHs.get(cluster.members[0]);
         if (hs) cluster.hs = hs.slice();
+        cluster.settleUntil = Date.now() + CLUSTER_SETTLE_MS;
       }
     }
     this._scheduleSave();
@@ -998,10 +1010,15 @@ class HueColorWheelCard extends HTMLElement {
     }
   }
 
-  /** Snap distance (px between pin centers) for merging / staying merged. */
+  /** Snap distance (px between pin centers) for merging two pins. */
   _mergeDistance() {
     const d = this._config.merge_distance;
     return d != null ? d : this._config.pin_size;
+  }
+
+  /** Distance a member must move to leave a stack — 2x merge for hysteresis. */
+  _strayDistance() {
+    return this._mergeDistance() * 2;
   }
 
   _refreshClusterStyles() {
@@ -1048,7 +1065,7 @@ class HueColorWheelCard extends HTMLElement {
     for (const id of moved) {
       if (!members.includes(id)) members.push(id);
     }
-    this._clusters.push({ members, hs });
+    this._clusters.push({ members, hs, settleUntil: Date.now() + CLUSTER_SETTLE_MS });
     this._scheduleSave();
     for (const id of moved) {
       this._lastHs.set(id, hs.slice());
@@ -1178,11 +1195,13 @@ class HueColorWheelCard extends HTMLElement {
     }
     if (Array.isArray(data.clusters)) {
       // restored stacks are re-validated by the stray check: members whose
-      // live color moved away since last session pop back out on their own
+      // live color moved away since last session pop back out on their own.
+      // A settle window covers the burst of state echoes right after load.
       this._clusters = data.clusters
         .map((c) => ({
           members: (c.members || []).filter((id) => this._pins.has(id)),
           hs: Array.isArray(c.hs) ? c.hs.slice(0, 2) : null,
+          settleUntil: Date.now() + CLUSTER_SETTLE_MS,
         }))
         .filter((c) => c.members.length >= 2 && c.hs);
     }
