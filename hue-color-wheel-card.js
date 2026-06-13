@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.2.1";
+const CARD_VERSION = "0.3.0";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -68,8 +68,10 @@ function xyToHs(dx, dy, radius) {
   const dist = Math.min(Math.sqrt(dx * dx + dy * dy), radius);
   let hue = (Math.atan2(-dy, dx) * 180) / Math.PI;
   if (hue < 0) hue += 360;
+  hue = Math.round(hue * 10) / 10;
+  if (hue >= 360) hue -= 360;
   const sat = radius > 0 ? (dist / radius) * 100 : 0;
-  return [Math.round(hue * 10) / 10, Math.round(sat * 10) / 10];
+  return [hue, Math.round(sat * 10) / 10];
 }
 
 function globToRegex(glob) {
@@ -96,6 +98,8 @@ class HueColorWheelCard extends HTMLElement {
     this._pins = new Map(); // entity -> {el, circle, label}
     this._lastHs = new Map(); // entity -> [h, s] last seen while on
     this._multi = new Set(); // entities selected for group drag / brightness
+    this._clusters = []; // merged pin stacks: {members: [entity...], hs}
+    this._clusterDirty = false;
     this._presets = {}; // preset name -> per-entity snapshot
     this._drag = null;
     this._radius = 0;
@@ -254,6 +258,11 @@ class HueColorWheelCard extends HTMLElement {
         .pin.off { opacity: 0.45; }
         .pin.off .pin-circle { filter: grayscale(0.7); }
         .pin.unavailable { opacity: 0.4; cursor: not-allowed; }
+        .pin.cluster-hidden { opacity: 0; pointer-events: none; }
+        .pin.merge-target .pin-circle {
+          transform: scale(1.25);
+          box-shadow: 0 0 0 3px rgba(255,255,255,0.7), 0 2px 6px rgba(0,0,0,0.5);
+        }
         .pin-circle {
           width: ${pinSize}px;
           height: ${pinSize}px;
@@ -270,7 +279,7 @@ class HueColorWheelCard extends HTMLElement {
           text-shadow: 0 1px 2px rgba(0,0,0,0.8);
           user-select: none;
           -webkit-user-select: none;
-          transition: background-color 0.3s ease;
+          transition: background-color 0.3s ease, transform 0.15s ease;
         }
         .pin.dragging .pin-circle { transition: none; }
         .pin.animating { transition: transform 0.7s cubic-bezier(0.25, 0.8, 0.3, 1); }
@@ -291,6 +300,27 @@ class HueColorWheelCard extends HTMLElement {
           user-select: none;
           -webkit-user-select: none;
         }
+        .pin-badge {
+          display: none;
+          position: absolute;
+          top: ${(hit - pinSize) / 2 - 5}px;
+          right: ${(hit - pinSize) / 2 - 5}px;
+          min-width: 16px;
+          height: 16px;
+          padding: 0 3px;
+          box-sizing: border-box;
+          border-radius: 8px;
+          background: #fff;
+          color: #000;
+          font-size: 10px;
+          font-weight: 600;
+          align-items: center;
+          justify-content: center;
+          box-shadow: 0 1px 3px rgba(0,0,0,0.5);
+          pointer-events: none;
+          z-index: 2;
+        }
+        .pin-badge.show { display: flex; }
         .brightness {
           display: ${cfg.show_brightness ? "flex" : "none"};
           align-items: center;
@@ -465,6 +495,9 @@ class HueColorWheelCard extends HTMLElement {
       const circle = document.createElement("div");
       circle.className = "pin-circle";
       pin.appendChild(circle);
+      const badge = document.createElement("div");
+      badge.className = "pin-badge";
+      pin.appendChild(badge);
       let label = null;
       if (this._config.show_labels) {
         label = document.createElement("div");
@@ -473,7 +506,7 @@ class HueColorWheelCard extends HTMLElement {
       }
       pin.addEventListener("pointerdown", (ev) => this._onPinDown(ev, light.entity));
       this._pinsEl.appendChild(pin);
-      this._pins.set(light.entity, { el: pin, circle, label, cfg: light });
+      this._pins.set(light.entity, { el: pin, circle, badge, label, cfg: light });
     }
 
     this._presets = this._loadPresets();
@@ -550,7 +583,14 @@ class HueColorWheelCard extends HTMLElement {
     if (unsupported.length) {
       this._ctNote.textContent = `Not shown (no color support): ${unsupported.join(", ")}`;
     }
+    this._refreshClusterStyles();
     this._updateBrightnessUi();
+    if (this._clusterDirty) {
+      // a member left its cluster mid-update; one more pass settles
+      // labels and badges (memberships are stable on the second run)
+      this._clusterDirty = false;
+      this._updateAll();
+    }
   }
 
   _updatePin(entity, pin, stateObj) {
@@ -558,11 +598,6 @@ class HueColorWheelCard extends HTMLElement {
     const exists = !!stateObj;
     const unavailable = !exists || stateObj.state === "unavailable" || stateObj.state === "unknown";
     const isOn = exists && stateObj.state === "on";
-
-    if (pin.label) {
-      pin.label.textContent =
-        pin.cfg.label || (exists && stateObj.attributes.friendly_name) || entity;
-    }
 
     pin.el.classList.toggle("unavailable", unavailable);
     pin.el.classList.toggle("off", !unavailable && !isOn);
@@ -572,9 +607,35 @@ class HueColorWheelCard extends HTMLElement {
       this._lastHs.set(entity, stateObj.attributes.hs_color.slice(0, 2));
     }
 
+    // a member leaves its cluster when it turns off or when something
+    // external moves its color visibly away from the stack
+    let cluster = this._clusterFor(entity);
+    if (cluster && !dragging) {
+      const cur = this._lastHs.get(entity);
+      let strayed = !unavailable && !isOn;
+      if (!strayed && isOn && cur && this._radius > 0) {
+        const a = hsToXy(cur[0], cur[1], this._radius);
+        const b = hsToXy(cluster.hs[0], cluster.hs[1], this._radius);
+        strayed = Math.hypot(a[0] - b[0], a[1] - b[1]) > this._config.pin_size;
+      }
+      if (strayed) {
+        this._removeFromCluster(entity);
+        this._clusterDirty = true;
+        cluster = null;
+      }
+    }
+
+    if (pin.label) {
+      const base = pin.cfg.label || (exists && stateObj.attributes.friendly_name) || entity;
+      pin.label.textContent =
+        cluster && cluster.members[0] === entity
+          ? `${base} +${cluster.members.length - 1}`
+          : base;
+    }
+
     if (dragging) return; // don't fight the user's finger
 
-    const hs = this._lastHs.get(entity) || [0, 0];
+    const hs = cluster ? cluster.hs : this._lastHs.get(entity) || [0, 0];
     this._positionPin(pin, hs);
 
     if (unavailable) {
@@ -599,7 +660,8 @@ class HueColorWheelCard extends HTMLElement {
   _positionAllPins() {
     for (const [entity, pin] of this._pins) {
       if (this._drag && this._drag.members.has(entity)) continue;
-      const hs = this._lastHs.get(entity) || [0, 0];
+      const cluster = this._clusterFor(entity);
+      const hs = cluster ? cluster.hs : this._lastHs.get(entity) || [0, 0];
       this._positionPin(pin, hs);
     }
   }
@@ -613,19 +675,26 @@ class HueColorWheelCard extends HTMLElement {
     ev.stopPropagation();
     pin.el.setPointerCapture(ev.pointerId);
 
-    // dragging a selected pin moves the whole selection together
-    const group =
-      this._multi.has(entity) && this._multi.size > 1
-        ? [...this._multi].filter(
-            (id) => !this._pins.get(id)?.el.classList.contains("unavailable")
-          )
-        : [entity];
+    // dragging a selected pin moves the whole selection together; cluster
+    // members always come along with their stack
+    const seeds =
+      this._multi.has(entity) && this._multi.size > 1 ? [...this._multi] : [entity];
+    const group = [];
+    for (const seed of seeds) {
+      const cluster = this._clusterFor(seed);
+      for (const id of cluster ? cluster.members : [seed]) {
+        if (group.includes(id)) continue;
+        if (this._pins.get(id)?.el.classList.contains("unavailable")) continue;
+        group.push(id);
+      }
+    }
 
     // each member's wheel position at drag start; the pointer delta is
     // applied to all of them so the group keeps its relative arrangement
     const startXy = new Map();
     for (const id of group) {
-      const hs = this._lastHs.get(id) || [0, 0];
+      const cluster = this._clusterFor(id);
+      const hs = cluster ? cluster.hs : this._lastHs.get(id) || [0, 0];
       startXy.set(id, hsToXy(hs[0], hs[1], this._radius));
     }
 
@@ -637,6 +706,7 @@ class HueColorWheelCard extends HTMLElement {
       startX: ev.clientX,
       startY: ev.clientY,
       moved: false,
+      mergeTarget: null,
       lastHs: new Map(),
     };
 
@@ -665,6 +735,8 @@ class HueColorWheelCard extends HTMLElement {
       }
     }
     const r = this._radius;
+    let pressedX = 0;
+    let pressedY = 0;
     for (const id of drag.members) {
       const [sx, sy] = drag.startXy.get(id);
       let x = sx + dxp;
@@ -674,6 +746,10 @@ class HueColorWheelCard extends HTMLElement {
         x *= r / dist;
         y *= r / dist;
       }
+      if (id === entity) {
+        pressedX = x;
+        pressedY = y;
+      }
       const hs = xyToHs(x, y, r);
       drag.lastHs.set(id, hs);
       const p = this._pins.get(id);
@@ -681,6 +757,16 @@ class HueColorWheelCard extends HTMLElement {
       p.circle.style.background = rgbCss(hsv2rgb(hs[0], hs[1] / 100, 1));
       p.el.classList.remove("off");
       this._throttledColorCall(id, hs);
+    }
+
+    // hovering near another pin offers a merge: highlight the target
+    const target = this._findMergeTarget(pressedX, pressedY, drag.members);
+    if (target !== drag.mergeTarget) {
+      if (drag.mergeTarget) {
+        this._pins.get(drag.mergeTarget)?.el.classList.remove("merge-target");
+      }
+      drag.mergeTarget = target;
+      if (target) this._pins.get(target).el.classList.add("merge-target");
     }
   }
 
@@ -691,18 +777,41 @@ class HueColorWheelCard extends HTMLElement {
     for (const id of drag.members) {
       this._pins.get(id).el.classList.remove("dragging");
     }
+    if (drag.mergeTarget) {
+      this._pins.get(drag.mergeTarget)?.el.classList.remove("merge-target");
+    }
 
     if (!drag.moved) {
       this._onPinTap(entity);
       return;
     }
+
+    if (drag.mergeTarget) {
+      // dropped onto another pin: snap the dragged lights into its stack
+      this._mergeInto(drag.mergeTarget, drag.members);
+      return;
+    }
+
     for (const [id, hs] of drag.lastHs) {
       this._lastHs.set(id, hs);
       this._sendColor(id, hs); // final, authoritative call
     }
+    // clusters dragged as a whole keep their stacked position
+    for (const cluster of this._clusters) {
+      if (cluster.members.every((m) => drag.members.has(m))) {
+        const hs = drag.lastHs.get(cluster.members[0]);
+        if (hs) cluster.hs = hs.slice();
+      }
+    }
   }
 
   _onPinTap(entity) {
+    const cluster = this._clusterFor(entity);
+    if (cluster) {
+      // tapping a stacked pin fans its lights back out
+      this._splitCluster(cluster);
+      return;
+    }
     const stateObj = this._hass.states[entity];
     if (stateObj && stateObj.state === "off") {
       this._hass.callService("light", "turn_on", { entity_id: entity });
@@ -753,6 +862,113 @@ class HueColorWheelCard extends HTMLElement {
       entity_id: entity,
       hs_color: [hs[0], hs[1]],
     });
+  }
+
+  /* ------------------------------------------------------------ clusters */
+
+  _clusterFor(entity) {
+    return this._clusters.find((c) => c.members.includes(entity)) || null;
+  }
+
+  _removeFromCluster(entity) {
+    const cluster = this._clusterFor(entity);
+    if (!cluster) return;
+    cluster.members = cluster.members.filter((id) => id !== entity);
+    if (cluster.members.length < 2) {
+      this._clusters = this._clusters.filter((c) => c !== cluster);
+    }
+  }
+
+  _refreshClusterStyles() {
+    for (const [entity, pin] of this._pins) {
+      const cluster = this._clusterFor(entity);
+      const isRep = !!cluster && cluster.members[0] === entity;
+      pin.el.classList.toggle("cluster-hidden", !!cluster && !isRep);
+      pin.badge.classList.toggle("show", isRep);
+      if (isRep) pin.badge.textContent = String(cluster.members.length);
+    }
+  }
+
+  /** Find an "on", visible pin near (x, y) wheel coords to merge into. */
+  _findMergeTarget(x, y, excludeSet) {
+    const r = this._radius;
+    let best = null;
+    let bestDist = this._config.pin_size; // snap distance between centers
+    for (const [id, pin] of this._pins) {
+      if (excludeSet.has(id)) continue;
+      if (pin.el.style.display === "none") continue;
+      const s = this._hass.states[id];
+      if (!s || s.state !== "on") continue;
+      const cluster = this._clusterFor(id);
+      if (cluster && cluster.members[0] !== id) continue; // only the visible top pin
+      const hs = cluster ? cluster.hs : this._lastHs.get(id) || [0, 0];
+      const [tx, ty] = hsToXy(hs[0], hs[1], r);
+      const dist = Math.hypot(tx - x, ty - y);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = id;
+      }
+    }
+    return best;
+  }
+
+  _mergeInto(targetEntity, draggedMembers) {
+    const targetCluster = this._clusterFor(targetEntity);
+    const hs = (targetCluster ? targetCluster.hs : this._lastHs.get(targetEntity) || [0, 0]).slice();
+    const members = targetCluster ? [...targetCluster.members] : [targetEntity];
+    const moved = [...draggedMembers];
+    this._clusters = this._clusters.filter(
+      (c) => c !== targetCluster && !moved.some((id) => c.members.includes(id))
+    );
+    for (const id of moved) {
+      if (!members.includes(id)) members.push(id);
+    }
+    this._clusters.push({ members, hs });
+    for (const id of moved) {
+      this._lastHs.set(id, hs.slice());
+      const pin = this._pins.get(id);
+      pin.el.classList.add("animating");
+      this._positionPin(pin, hs);
+      pin.circle.style.background = rgbCss(hsv2rgb(hs[0], hs[1] / 100, 1));
+      this._sendColor(id, hs);
+    }
+    this._refreshClusterStyles();
+    this._updateAll();
+    clearTimeout(this._animTimer);
+    this._animTimer = setTimeout(() => {
+      for (const pin of this._pins.values()) pin.el.classList.remove("animating");
+    }, 800);
+  }
+
+  _splitCluster(cluster) {
+    this._clusters = this._clusters.filter((c) => c !== cluster);
+    const r = this._radius;
+    const [cx, cy] = hsToXy(cluster.hs[0], cluster.hs[1], r);
+    const spread = Math.max(this._config.pin_size, 30);
+    const n = cluster.members.length;
+    cluster.members.forEach((id, i) => {
+      const angle = (i / n) * 2 * Math.PI;
+      let x = cx + spread * Math.cos(angle);
+      let y = cy + spread * Math.sin(angle);
+      const dist = Math.hypot(x, y);
+      if (dist > r && dist > 0) {
+        x *= r / dist;
+        y *= r / dist;
+      }
+      const hs = xyToHs(x, y, r);
+      this._lastHs.set(id, hs);
+      const pin = this._pins.get(id);
+      pin.el.classList.add("animating");
+      pin.el.style.transform = `translate(${r + x}px, ${r + y}px)`;
+      pin.circle.style.background = rgbCss(hsv2rgb(hs[0], hs[1] / 100, 1));
+      this._sendColor(id, hs);
+    });
+    this._refreshClusterStyles();
+    this._updateAll();
+    clearTimeout(this._animTimer);
+    this._animTimer = setTimeout(() => {
+      for (const pin of this._pins.values()) pin.el.classList.remove("animating");
+    }, 800);
   }
 
   /* ------------------------------------------------------------ presets */
@@ -807,6 +1023,9 @@ class HueColorWheelCard extends HTMLElement {
   _applyPreset(name) {
     const snapshot = this._presets[name];
     if (!snapshot) return;
+    // presets recall exact per-light positions, so dissolve any stacks
+    this._clusters = [];
+    this._refreshClusterStyles();
     for (const [entity, saved] of Object.entries(snapshot)) {
       const pin = this._pins.get(entity);
       if (!pin || pin.el.classList.contains("unavailable")) continue;

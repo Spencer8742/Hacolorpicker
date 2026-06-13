@@ -17,6 +17,11 @@ time. No build step, no dependencies — a single JS file.
 - Tap an **off** light's pin to turn it on; tap an **on** light's pin to
   select it and adjust its brightness with the slider below the wheel.
   With nothing selected, the slider adjusts all currently-on lights.
+- **Merge by drop (like the Hue app)**: drag a pin onto another pin — the
+  target highlights while you hover, and dropping snaps them into a single
+  stacked pin with a count badge. The stack drags as one unit and all its
+  lights share one color. Tap the stack to split it back apart (the pins
+  fan out with a smooth animation).
 - **Multi-select & group drag**: tap several pins to select them, then drag
   any selected pin — the whole group moves together, keeping its relative
   arrangement on the wheel. The brightness slider applies to the selection.
@@ -108,6 +113,8 @@ Either `lights` or `auto_entities` is required.
 | Gesture | Result |
 | ------- | ------ |
 | Drag a pin | Live color change for that light (`hs_color`), throttled during drag |
+| Drop a pin onto another pin | Merge them into a stacked pin (badge shows the count); the stack moves as one |
+| Tap a stacked pin | Split the stack — pins fan back out around the spot |
 | Tap an on light's pin | Toggle it in/out of the selection (selected pins show a ring) |
 | Tap several pins, then drag one | The whole selection moves together as a group |
 | Tap an off light's pin | Turn it on |
@@ -130,3 +137,8 @@ Either `lights` or `auto_entities` is required.
   as a native HA scene; presets here are meant for quick dashboard recall.
 - During a group drag, the per-light call throttle widens with the group
   size so the total WebSocket call rate stays roughly constant.
+- Merged stacks live in card memory for the session. A stack dissolves on
+  its own if a member turns off or something external (automation, Hue
+  app) moves a member's color visibly away from the stack. Because a
+  tap on a stack splits it, use the global slider (or split first) to
+  change a stack's brightness.
