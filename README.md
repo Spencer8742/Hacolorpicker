@@ -24,11 +24,16 @@ time. No build step, no dependencies — a single JS file.
   With nothing selected, the slider adjusts all currently-on lights.
 - **Merge by drop (like the Hue app)**: drag a pin onto another pin — the
   target highlights while you hover, and dropping snaps them into a single
-  stacked pin with a count badge. The stack drags as one unit and all its
-  lights share one color. **Tap the stack to open it into a ring** (a Hue-
-  style "well" with the member pins around the rim); **drag a pin out of the
-  ring to remove just that light** from the group, while the rest stay
-  grouped. Tap the empty wheel to close the ring.
+  stacked pin labeled **Group N** with a count badge. The stack drags as one
+  unit and all its lights share one color/temperature. **Tap the stack to
+  open it into a ring** (a Hue-style "well" with the member pins around the
+  rim, each showing its own name); **drag a pin out of the ring to remove
+  just that light** from the group, while the rest stay grouped. Tap the
+  empty wheel to close the ring.
+- **Groups are sticky** — once grouped, lights stay grouped through on/off
+  changes, external recoloring, scenes, and switching between color and
+  white modes. Membership only changes when you explicitly merge two pins or
+  drag one out of an open ring, so you never have to rebuild a group.
 - **Multi-select & group drag**: tap several pins to select them, then drag
   any selected pin — the whole group moves together, keeping its relative
   arrangement on the wheel. The brightness slider applies to the selection.
@@ -208,7 +213,7 @@ Either `lights` or `auto_entities` is required.
   from the stack. Tap a stack to open its ring — the whole group is
   selected for the brightness slider while open — and drag individual pins
   out of the ring to remove them.
-- Merging/stacks are a **color-mode** feature. In white (temperature) mode
-  every light shows as its own pin; switching back to color mode restores
-  any stacks. The white-mode wheel is a vertical warm→cool gradient, so a
+- Groups work in **both** color and white modes and persist across the
+  toggle: a group shares one color in color mode and one temperature in
+  white mode. The white-mode wheel is a vertical warm→cool gradient, so a
   pin's vertical position is its temperature (horizontal is just spacing).

@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.8.0";
+const CARD_VERSION = "0.9.0";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -41,6 +41,7 @@ const COLOR_MODES_WHEEL = ["hs", "xy", "rgb", "rgbw", "rgbww"];
 // positioning; per-light sends are clamped to each light's own range.
 const TEMP_MIN_K = 2000; // warmest (amber) — top of the wheel
 const TEMP_MAX_K = 6500; // coolest (blue-white) — bottom of the wheel
+const DEFAULT_TEMP_K = 3500; // neutral default for values not yet set in white mode
 
 /* ---------------------------------------------------------------- color math */
 
@@ -179,7 +180,8 @@ class HueColorWheelCard extends HTMLElement {
     };
     this._multi = new Set(); // entities selected for group drag / brightness
     this._selectedCluster = null; // cluster selected for brightness (first tap)
-    this._clusters = []; // merged pin stacks: {members: [entity...], hs}
+    this._clusters = []; // merged pin stacks: {members, hs, temp, no}
+    this._groupSeq = 0; // counter for stable "Group N" labels
     this._expandedCluster = null; // cluster currently opened into a ring
     this._expand = null; // {cluster, cx, cy, trayR, slots} geometry while open
     this._clusterDirty = false;
@@ -395,7 +397,8 @@ class HueColorWheelCard extends HTMLElement {
           transform: translate(-50%, -50%);
           pointer-events: none;
           transition: opacity 0.2s ease;
-          z-index: 1;
+          /* sits above the canvas but below the pins (which follow it in the
+             DOM) so the light markers and labels are never covered */
         }
         .expand-tray[hidden] { display: none; }
         .mode-toggle {
@@ -834,46 +837,24 @@ class HueColorWheelCard extends HTMLElement {
       }
     }
 
-    // a member leaves its cluster when it turns off or when something
-    // external moves its color visibly away from the stack. We skip this
-    // while the stack is still settling, otherwise stale state echoes from a
-    // fast drag (bulbs catching up) would scatter the group right after you
-    // let go. Straying also uses a larger threshold than merging
-    // (hysteresis) so per-bulb color quantization at rest can't trip it.
-    // Clustering is a color-mode feature; in white mode every pin is shown
-    // and positioned individually by its temperature.
-    let cluster = this._mode === "white" ? null : this._clusterFor(entity);
-    const settling = cluster && cluster.settleUntil && Date.now() < cluster.settleUntil;
-    // While a ring is open, removal is explicit (drag a pin out), so never
-    // auto-stray its members.
-    const expandedMember = cluster && cluster === this._expandedCluster;
-    if (cluster && !dragging && !settling && !expandedMember) {
-      const cur = this._lastHs.get(entity);
-      let strayed = !unavailable && !isOn;
-      if (!strayed && isOn && cur && this._radius > 0) {
-        const a = hsToXy(cur[0], cur[1], this._radius);
-        const b = hsToXy(cluster.hs[0], cluster.hs[1], this._radius);
-        strayed = Math.hypot(a[0] - b[0], a[1] - b[1]) > this._strayDistance();
-      }
-      if (strayed) {
-        this._removeFromCluster(entity);
-        this._clusterDirty = true;
-        this._scheduleSave();
-        cluster = null;
-      }
-    }
+    // Groups are sticky: membership changes only when you explicitly merge
+    // two pins or drag one out of an open ring. A light turning on/off or
+    // being recolored elsewhere does NOT remove it from its group, so you
+    // never have to rebuild groups after an external change.
+    const cluster = this._clusterFor(entity);
 
     if (pin.label) {
-      const base = pin.cfg.label || (exists && stateObj.attributes.friendly_name) || entity;
+      const own = pin.cfg.label || (exists && stateObj.attributes.friendly_name) || entity;
+      // open ring: each pin shows its own name; collapsed stack: "Group N"
       pin.label.textContent =
-        cluster && cluster.members[0] === entity
-          ? `${base} +${cluster.members.length - 1}`
-          : base;
+        cluster && cluster !== this._expandedCluster && cluster.members[0] === entity
+          ? this._groupName(cluster)
+          : own;
     }
 
     if (dragging) return; // don't fight the user's finger
     // a ring member's position is owned by the layout / its extract drag
-    if (expandedMember) return;
+    if (cluster && cluster === this._expandedCluster) return;
 
     const [x, y] = this._pinXY(entity, cluster);
     pin.el.style.transform = `translate(${this._radius + x}px, ${this._radius + y}px)`;
@@ -894,29 +875,51 @@ class HueColorWheelCard extends HTMLElement {
     pin.el.style.transform = `translate(${r + x}px, ${r + y}px)`;
   }
 
+  /** Wheel-local [x, y] of a cluster's shared value in the current mode. */
+  _clusterXY(cluster) {
+    const r = this._radius;
+    if (this._mode === "white") {
+      return [cluster.whiteX ?? 0, tempToY(cluster.temp || DEFAULT_TEMP_K, r)];
+    }
+    return hsToXy(cluster.hs[0], cluster.hs[1], r);
+  }
+
+  /** Fill color of a cluster's shared value in the current mode. */
+  _clusterRgb(cluster) {
+    if (this._mode === "white") return kelvinToRgb(cluster.temp || DEFAULT_TEMP_K);
+    return hsv2rgb(cluster.hs[0], cluster.hs[1] / 100, 1);
+  }
+
+  /** Generic label for a collapsed stack, e.g. "Group 2". */
+  _groupName(cluster) {
+    return `Group ${cluster.no || "?"}`;
+  }
+
   /** Wheel-local [x, y] for a pin in the current mode. */
   _pinXY(entity, cluster) {
     const r = this._radius;
+    if (cluster) return this._clusterXY(cluster);
     if (this._mode === "white") {
-      const k = this._lastTemp.get(entity) || TEMP_MIN_K;
+      const k = this._lastTemp.get(entity) || DEFAULT_TEMP_K;
       let x = this._whiteX.get(entity);
       if (x == null) x = this._defaultWhiteX(entity);
       return [x, tempToY(k, r)];
     }
-    const hs = cluster ? cluster.hs : this._lastHs.get(entity) || [0, 0];
+    const hs = this._lastHs.get(entity) || [0, 0];
     return hsToXy(hs[0], hs[1], r);
   }
 
   /** Fill color for a pin in the current mode. */
   _pinRgb(entity, stateObj, cluster) {
+    if (cluster) return this._clusterRgb(cluster);
     const isOn = stateObj && stateObj.state === "on";
     if (this._mode === "white") {
-      return kelvinToRgb(this._lastTemp.get(entity) || TEMP_MIN_K);
+      return kelvinToRgb(this._lastTemp.get(entity) || DEFAULT_TEMP_K);
     }
     if (isOn && Array.isArray(stateObj.attributes.rgb_color)) {
       return stateObj.attributes.rgb_color;
     }
-    const hs = cluster ? cluster.hs : this._lastHs.get(entity) || [0, 0];
+    const hs = this._lastHs.get(entity) || [0, 0];
     return hsv2rgb(hs[0], hs[1] / 100, 1);
   }
 
@@ -934,7 +937,7 @@ class HueColorWheelCard extends HTMLElement {
       if (this._drag && this._drag.members.has(entity)) continue;
       // members of an open ring are positioned by _layoutExpanded, not here
       if (this._expandedCluster && this._expandedCluster.members.includes(entity)) continue;
-      const cluster = this._mode === "white" ? null : this._clusterFor(entity);
+      const cluster = this._clusterFor(entity);
       const [x, y] = this._pinXY(entity, cluster);
       pin.el.style.transform = `translate(${this._radius + x}px, ${this._radius + y}px)`;
     }
@@ -955,20 +958,13 @@ class HueColorWheelCard extends HTMLElement {
     // "extract" drag: only that pin moves, and dropping it clear of the well
     // removes it from the group.
     const extract =
-      this._mode !== "white" &&
-      this._expandedCluster &&
-      this._expandedCluster.members.includes(entity);
+      this._expandedCluster && this._expandedCluster.members.includes(entity);
 
     let group;
     const startXy = new Map();
-    if (this._mode === "white") {
-      // white mode: no clustering — drag the single grabbed pin's temperature
+    if (extract) {
       group = [entity];
-      startXy.set(entity, this._pinXY(entity, null));
-    } else if (extract) {
-      group = [entity];
-      const slot = this._expand?.slots.get(entity) ||
-        hsToXy(this._expandedCluster.hs[0], this._expandedCluster.hs[1], this._radius);
+      const slot = this._expand?.slots.get(entity) || this._clusterXY(this._expandedCluster);
       startXy.set(entity, slot);
     } else {
       // dragging a selected pin moves the whole selection together; cluster
@@ -988,8 +984,7 @@ class HueColorWheelCard extends HTMLElement {
       // applied to all of them so the group keeps its relative arrangement
       for (const id of group) {
         const cluster = this._clusterFor(id);
-        const hs = cluster ? cluster.hs : this._lastHs.get(id) || [0, 0];
-        startXy.set(id, hsToXy(hs[0], hs[1], this._radius));
+        startXy.set(id, cluster ? this._clusterXY(cluster) : this._pinXY(id, null));
       }
     }
 
@@ -1089,73 +1084,29 @@ class HueColorWheelCard extends HTMLElement {
       }
     }
     const r = this._radius;
-
-    if (this._mode === "white") {
-      // drag up/down to set color temperature; horizontal is kept for spacing
-      const [sx, sy] = drag.startXy.get(entity);
-      let x = sx + dxp;
-      let y = sy + dyp;
-      const d = Math.hypot(x, y);
-      if (d > r && d > 0) {
-        x *= r / d;
-        y *= r / d;
-      }
-      const k = yToTemp(y, r);
-      drag.lastTemp.set(entity, k);
-      this._whiteX.set(entity, x);
-      const pin = this._pins.get(entity);
-      pin.el.style.transform = `translate(${r + x}px, ${r + y}px)`;
-      pin.circle.style.background = rgbCss(kelvinToRgb(k));
-      pin.el.classList.remove("off");
-      this._throttledColorCall(entity, k); // value-agnostic; _sendValue sends temp
-      return;
-    }
+    const white = this._mode === "white";
 
     if (drag.extract) {
       // single pin follows the finger; it leaves the group if pulled clear
-      const [sx, sy] = drag.startXy.get(entity);
-      let x = sx + dxp;
-      let y = sy + dyp;
-      const d = Math.sqrt(x * x + y * y);
-      if (d > r && d > 0) {
-        x *= r / d;
-        y *= r / d;
-      }
-      const hs = xyToHs(x, y, r);
-      drag.lastHs.set(entity, hs);
-      const pin = this._pins.get(entity);
-      pin.el.style.transform = `translate(${r + x}px, ${r + y}px)`;
-      pin.circle.style.background = rgbCss(hsv2rgb(hs[0], hs[1] / 100, 1));
+      const { x, y } = this._dragPoint(drag, entity, dxp, dyp, r);
+      this._applyDragValue(drag, entity, x, y, r);
       const ex = this._expand;
       const outside =
         ex && Math.hypot(x - ex.cx, y - ex.cy) > ex.trayR + this._config.pin_size;
       drag.willRemove = !!outside;
-      pin.el.classList.toggle("removing", drag.willRemove);
-      this._throttledColorCall(entity, hs);
+      this._pins.get(entity).el.classList.toggle("removing", drag.willRemove);
       return;
     }
+
     let pressedX = 0;
     let pressedY = 0;
     for (const id of drag.members) {
-      const [sx, sy] = drag.startXy.get(id);
-      let x = sx + dxp;
-      let y = sy + dyp;
-      const dist = Math.sqrt(x * x + y * y);
-      if (dist > r && dist > 0) {
-        x *= r / dist;
-        y *= r / dist;
-      }
+      const { x, y } = this._dragPoint(drag, id, dxp, dyp, r);
       if (id === entity) {
         pressedX = x;
         pressedY = y;
       }
-      const hs = xyToHs(x, y, r);
-      drag.lastHs.set(id, hs);
-      const p = this._pins.get(id);
-      p.el.style.transform = `translate(${r + x}px, ${r + y}px)`;
-      p.circle.style.background = rgbCss(hsv2rgb(hs[0], hs[1] / 100, 1));
-      p.el.classList.remove("off");
-      this._throttledColorCall(id, hs);
+      this._applyDragValue(drag, id, x, y, r);
     }
 
     // hovering near another pin offers a merge: highlight the target
@@ -1166,6 +1117,38 @@ class HueColorWheelCard extends HTMLElement {
       }
       drag.mergeTarget = target;
       if (target) this._pins.get(target).el.classList.add("merge-target");
+    }
+  }
+
+  /** Clamp a member's start position + pointer delta to inside the wheel. */
+  _dragPoint(drag, id, dxp, dyp, r) {
+    const [sx, sy] = drag.startXy.get(id);
+    let x = sx + dxp;
+    let y = sy + dyp;
+    const d = Math.sqrt(x * x + y * y);
+    if (d > r && d > 0) {
+      x *= r / d;
+      y *= r / d;
+    }
+    return { x, y };
+  }
+
+  /** Move a pin during a drag and record its value for the active mode. */
+  _applyDragValue(drag, id, x, y, r) {
+    const pin = this._pins.get(id);
+    pin.el.style.transform = `translate(${r + x}px, ${r + y}px)`;
+    pin.el.classList.remove("off");
+    if (this._mode === "white") {
+      const k = yToTemp(y, r);
+      drag.lastTemp.set(id, k);
+      this._whiteX.set(id, x);
+      pin.circle.style.background = rgbCss(kelvinToRgb(k));
+      this._throttledColorCall(id, k);
+    } else {
+      const hs = xyToHs(x, y, r);
+      drag.lastHs.set(id, hs);
+      pin.circle.style.background = rgbCss(hsv2rgb(hs[0], hs[1] / 100, 1));
+      this._throttledColorCall(id, hs);
     }
   }
 
@@ -1185,27 +1168,15 @@ class HueColorWheelCard extends HTMLElement {
       return;
     }
 
-    if (this._mode === "white") {
-      const k = drag.lastTemp.get(entity);
-      if (k != null) {
-        this._lastTemp.set(entity, k);
-        this._sendTemp(entity, k); // final, authoritative call
-      }
-      this._scheduleSave();
-      return;
-    }
+    const white = this._mode === "white";
 
     if (drag.extract) {
       this._pins.get(entity).el.classList.remove("removing");
       const cluster = drag.cluster;
       if (drag.willRemove) {
-        // pulled clear of the well: leave the group at the dropped colour
-        const hs = drag.lastHs.get(entity);
+        // pulled clear of the well: leave the group at the dropped value
         this._removeFromCluster(entity);
-        if (hs) {
-          this._lastHs.set(entity, hs);
-          this._sendColor(entity, hs);
-        }
+        this._commitDragValue(drag, entity);
         this._scheduleSave();
         if (!this._clusters.includes(cluster) || cluster.members.length < 2) {
           this._closeCluster(); // fewer than 2 left — stack dissolved
@@ -1213,9 +1184,14 @@ class HueColorWheelCard extends HTMLElement {
           this._layoutExpanded(); // reflow the pins that stayed
         }
       } else {
-        // dropped back inside: stays in the group at the stack colour
-        this._sendColor(entity, cluster.hs);
-        this._lastHs.set(entity, cluster.hs.slice());
+        // dropped back inside: stays in the group at the stack value
+        if (white) {
+          this._lastTemp.set(entity, cluster.temp || DEFAULT_TEMP_K);
+          this._sendTemp(entity, cluster.temp || DEFAULT_TEMP_K);
+        } else {
+          this._lastHs.set(entity, cluster.hs.slice());
+          this._sendColor(entity, cluster.hs);
+        }
         cluster.settleUntil = Date.now() + CLUSTER_SETTLE_MS;
         this._layoutExpanded();
       }
@@ -1228,20 +1204,42 @@ class HueColorWheelCard extends HTMLElement {
       return;
     }
 
-    for (const [id, hs] of drag.lastHs) {
-      this._lastHs.set(id, hs);
-      this._sendColor(id, hs); // final, authoritative call
-    }
-    // clusters dragged as a whole keep their stacked position; restart the
+    for (const id of drag.members) this._commitDragValue(drag, id);
+    // clusters dragged as a whole keep their stacked value; restart the
     // settle window so stale echoes from this drag can't dissolve them
     for (const cluster of this._clusters) {
       if (cluster.members.every((m) => drag.members.has(m))) {
-        const hs = drag.lastHs.get(cluster.members[0]);
-        if (hs) cluster.hs = hs.slice();
+        const rep = cluster.members[0];
+        if (white) {
+          const k = drag.lastTemp.get(rep);
+          if (k != null) cluster.temp = k;
+          const x = this._whiteX.get(rep);
+          if (x != null) cluster.whiteX = x;
+        } else {
+          const hs = drag.lastHs.get(rep);
+          if (hs) cluster.hs = hs.slice();
+        }
         cluster.settleUntil = Date.now() + CLUSTER_SETTLE_MS;
       }
     }
     this._scheduleSave();
+  }
+
+  /** Persist + send a member's final dragged value for the active mode. */
+  _commitDragValue(drag, id) {
+    if (this._mode === "white") {
+      const k = drag.lastTemp.get(id);
+      if (k != null) {
+        this._lastTemp.set(id, k);
+        this._sendTemp(id, k);
+      }
+    } else {
+      const hs = drag.lastHs.get(id);
+      if (hs) {
+        this._lastHs.set(id, hs);
+        this._sendColor(id, hs);
+      }
+    }
   }
 
   _onPinTap(entity) {
@@ -1283,8 +1281,8 @@ class HueColorWheelCard extends HTMLElement {
     this._expandedCluster = cluster;
     const r = this._radius;
     const trayR = Math.min(Math.max(r * 0.42, 56), 120);
-    // centre the well on the stack's colour, clamped to stay inside the wheel
-    let [cx, cy] = hsToXy(cluster.hs[0], cluster.hs[1], r);
+    // centre the well on the stack's value, clamped to stay inside the wheel
+    let [cx, cy] = this._clusterXY(cluster);
     const mag = Math.hypot(cx, cy);
     const maxMag = Math.max(0, r - trayR - 4);
     if (mag > maxMag && mag > 0) {
@@ -1323,9 +1321,7 @@ class HueColorWheelCard extends HTMLElement {
       pin.el.classList.add("animating");
       pin.el.classList.remove("off", "removing");
       pin.el.style.transform = `translate(${r + x}px, ${r + y}px)`;
-      pin.circle.style.background = rgbCss(
-        hsv2rgb(ex.cluster.hs[0], ex.cluster.hs[1] / 100, 1)
-      );
+      pin.circle.style.background = rgbCss(this._clusterRgb(ex.cluster));
     });
     clearTimeout(this._animTimer);
     this._animTimer = setTimeout(() => {
@@ -1458,14 +1454,6 @@ class HueColorWheelCard extends HTMLElement {
   }
 
   _refreshClusterStyles() {
-    // white mode ignores clustering — every pin shows on its own
-    if (this._mode === "white") {
-      for (const [, pin] of this._pins) {
-        pin.el.classList.remove("cluster-hidden");
-        pin.badge.classList.remove("show");
-      }
-      return;
-    }
     const expanded = this._expandedCluster;
     for (const [entity, pin] of this._pins) {
       const cluster = this._clusterFor(entity);
@@ -1494,8 +1482,7 @@ class HueColorWheelCard extends HTMLElement {
       if (!s || s.state !== "on") continue;
       const cluster = this._clusterFor(id);
       if (cluster && cluster.members[0] !== id) continue; // only the visible top pin
-      const hs = cluster ? cluster.hs : this._lastHs.get(id) || [0, 0];
-      const [tx, ty] = hsToXy(hs[0], hs[1], r);
+      const [tx, ty] = cluster ? this._clusterXY(cluster) : this._pinXY(id, null);
       const dist = Math.hypot(tx - x, ty - y);
       if (dist < bestDist) {
         bestDist = dist;
@@ -1507,7 +1494,13 @@ class HueColorWheelCard extends HTMLElement {
 
   _mergeInto(targetEntity, draggedMembers) {
     const targetCluster = this._clusterFor(targetEntity);
+    // carry both a color and a temperature so the group works in either mode
     const hs = (targetCluster ? targetCluster.hs : this._lastHs.get(targetEntity) || [0, 0]).slice();
+    const temp = targetCluster
+      ? targetCluster.temp || DEFAULT_TEMP_K
+      : this._lastTemp.get(targetEntity) || DEFAULT_TEMP_K;
+    const no = targetCluster ? targetCluster.no : ++this._groupSeq;
+    const whiteX = targetCluster?.whiteX ?? 0;
     const members = targetCluster ? [...targetCluster.members] : [targetEntity];
     const moved = [...draggedMembers];
     this._clusters = this._clusters.filter(
@@ -1516,15 +1509,20 @@ class HueColorWheelCard extends HTMLElement {
     for (const id of moved) {
       if (!members.includes(id)) members.push(id);
     }
-    this._clusters.push({ members, hs, settleUntil: Date.now() + CLUSTER_SETTLE_MS });
+    const cluster = { members, hs, temp, no, whiteX, settleUntil: Date.now() + CLUSTER_SETTLE_MS };
+    this._clusters.push(cluster);
     this._scheduleSave();
+    const [cx, cy] = this._clusterXY(cluster);
+    const rgb = rgbCss(this._clusterRgb(cluster));
     for (const id of moved) {
       this._lastHs.set(id, hs.slice());
+      this._lastTemp.set(id, temp);
       const pin = this._pins.get(id);
       pin.el.classList.add("animating");
-      this._positionPin(pin, hs);
-      pin.circle.style.background = rgbCss(hsv2rgb(hs[0], hs[1] / 100, 1));
-      this._sendColor(id, hs);
+      pin.el.style.transform = `translate(${this._radius + cx}px, ${this._radius + cy}px)`;
+      pin.circle.style.background = rgb;
+      if (this._mode === "white") this._sendTemp(id, temp);
+      else this._sendColor(id, hs);
     }
     this._refreshClusterStyles();
     this._updateAll();
@@ -1723,16 +1721,20 @@ class HueColorWheelCard extends HTMLElement {
         this._lastBrightness.set(entity, pct);
       }
     }
+    if (typeof data.groupSeq === "number") {
+      this._groupSeq = Math.max(this._groupSeq, data.groupSeq);
+    }
     if (Array.isArray(data.clusters)) {
-      // stacks are re-validated by the stray check; a settle window covers
-      // the burst of state echoes right after applying them
       this._clusters = data.clusters
         .map((c) => ({
           members: (c.members || []).filter((id) => this._pins.has(id)),
-          hs: Array.isArray(c.hs) ? c.hs.slice(0, 2) : null,
+          hs: Array.isArray(c.hs) ? c.hs.slice(0, 2) : [0, 0],
+          temp: c.temp || DEFAULT_TEMP_K,
+          whiteX: typeof c.whiteX === "number" ? c.whiteX : 0,
+          no: c.no || ++this._groupSeq,
           settleUntil: Date.now() + CLUSTER_SETTLE_MS,
         }))
-        .filter((c) => c.members.length >= 2 && c.hs);
+        .filter((c) => c.members.length >= 2);
       this._selectedCluster = null;
       this._refreshClusterStyles?.();
     }
@@ -1743,7 +1745,14 @@ class HueColorWheelCard extends HTMLElement {
       v: 1,
       updatedAt: Date.now(),
       mode: this._mode,
-      clusters: this._clusters.map((c) => ({ members: [...c.members], hs: c.hs })),
+      groupSeq: this._groupSeq,
+      clusters: this._clusters.map((c) => ({
+        members: [...c.members],
+        hs: c.hs,
+        temp: c.temp,
+        whiteX: c.whiteX,
+        no: c.no,
+      })),
       lastHs: Object.fromEntries(this._lastHs),
       lastTemp: Object.fromEntries(this._lastTemp),
       whiteX: Object.fromEntries(this._whiteX),
