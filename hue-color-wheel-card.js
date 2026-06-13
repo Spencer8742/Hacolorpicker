@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.3.3";
+const CARD_VERSION = "0.4.0";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -81,6 +81,12 @@ function globToRegex(glob) {
   return new RegExp(`^${escaped}$`);
 }
 
+function hashString(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+
 /* ---------------------------------------------------------------- the card */
 
 class HueColorWheelCard extends HTMLElement {
@@ -99,6 +105,8 @@ class HueColorWheelCard extends HTMLElement {
     this._lights = null; // resolved [{entity, label}]
     this._pins = new Map(); // entity -> {el, circle, label}
     this._lastHs = new Map(); // entity -> [h, s] last seen while on
+    this._lastBrightness = new Map(); // entity -> pct last seen while on
+    this._saveTimer = null; // debounced persistence
     this._multi = new Set(); // entities selected for group drag / brightness
     this._selectedCluster = null; // cluster selected for brightness (first tap)
     this._clusters = []; // merged pin stacks: {members: [entity...], hs}
@@ -149,6 +157,10 @@ class HueColorWheelCard extends HTMLElement {
     for (const p of this._pendingCalls.values()) clearTimeout(p.timer);
     this._pendingCalls.clear();
     clearTimeout(this._animTimer);
+    if (this._saveTimer) {
+      clearTimeout(this._saveTimer);
+      this._saveStore(); // flush before the card goes away
+    }
     this._built = false;
   }
 
@@ -514,8 +526,8 @@ class HueColorWheelCard extends HTMLElement {
       this._pins.set(light.entity, { el: pin, circle, badge, label, cfg: light });
     }
 
-    this._presets = this._loadPresets();
     this._renderPresets();
+    this._restoreStore(); // async; re-renders presets/clusters when loaded
 
     this._resizeObserver = new ResizeObserver(() => this._onResize());
     this._resizeObserver.observe(this._wheelWrap);
@@ -609,7 +621,19 @@ class HueColorWheelCard extends HTMLElement {
     pin.el.classList.toggle("selected", this._multi.has(entity));
 
     if (isOn && Array.isArray(stateObj.attributes.hs_color)) {
-      this._lastHs.set(entity, stateObj.attributes.hs_color.slice(0, 2));
+      const hs = stateObj.attributes.hs_color.slice(0, 2);
+      const prev = this._lastHs.get(entity);
+      if (!prev || prev[0] !== hs[0] || prev[1] !== hs[1]) {
+        this._lastHs.set(entity, hs);
+        this._scheduleSave();
+      }
+    }
+    if (isOn && stateObj.attributes.brightness != null) {
+      const pct = Math.max(1, Math.round((stateObj.attributes.brightness / 255) * 100));
+      if (this._lastBrightness.get(entity) !== pct) {
+        this._lastBrightness.set(entity, pct);
+        this._scheduleSave();
+      }
     }
 
     // a member leaves its cluster when it turns off or when something
@@ -626,6 +650,7 @@ class HueColorWheelCard extends HTMLElement {
       if (strayed) {
         this._removeFromCluster(entity);
         this._clusterDirty = true;
+        this._scheduleSave();
         cluster = null;
       }
     }
@@ -808,6 +833,7 @@ class HueColorWheelCard extends HTMLElement {
         if (hs) cluster.hs = hs.slice();
       }
     }
+    this._scheduleSave();
   }
 
   _onPinTap(entity) {
@@ -947,6 +973,7 @@ class HueColorWheelCard extends HTMLElement {
       if (!members.includes(id)) members.push(id);
     }
     this._clusters.push({ members, hs });
+    this._scheduleSave();
     for (const id of moved) {
       this._lastHs.set(id, hs.slice());
       const pin = this._pins.get(id);
@@ -965,6 +992,7 @@ class HueColorWheelCard extends HTMLElement {
 
   _splitCluster(cluster) {
     this._clusters = this._clusters.filter((c) => c !== cluster);
+    this._scheduleSave();
     const r = this._radius;
     const [cx, cy] = hsToXy(cluster.hs[0], cluster.hs[1], r);
     const spread = Math.max(this._config.pin_size, 30);
@@ -994,28 +1022,117 @@ class HueColorWheelCard extends HTMLElement {
     }, 800);
   }
 
+  /* ------------------------------------------------------------ persistence
+   *
+   * Clusters, last-known colors/brightness, and presets are saved to Home
+   * Assistant's per-user frontend storage (frontend/set_user_data), so they
+   * survive reloads and follow the user across pages, browsers, and devices.
+   * localStorage doubles as a synchronous fallback for older HA versions.
+   */
+
+  _entityKey() {
+    return this._lights.map((l) => l.entity).sort().join(",");
+  }
+
+  _storeKey() {
+    return `hue_color_wheel_card_${hashString(this._entityKey())}`;
+  }
+
+  _localKey() {
+    return `hue-color-wheel-card:store:${this._entityKey()}`;
+  }
+
+  async _loadStore() {
+    try {
+      const resp = await this._hass.callWS({
+        type: "frontend/get_user_data",
+        key: this._storeKey(),
+      });
+      if (resp && resp.value) return resp.value;
+    } catch (e) {
+      // older HA or WS hiccup: fall back to this browser's storage
+    }
+    try {
+      const local = JSON.parse(localStorage.getItem(this._localKey()));
+      if (local) return local;
+    } catch (e) {
+      /* ignore */
+    }
+    // migrate presets saved by pre-0.4 card versions
+    try {
+      const legacy = JSON.parse(
+        localStorage.getItem(`hue-color-wheel-card:presets:${this._entityKey()}`)
+      );
+      if (legacy) return { presets: legacy };
+    } catch (e) {
+      /* ignore */
+    }
+    return null;
+  }
+
+  async _restoreStore() {
+    const data = await this._loadStore();
+    if (!data || !this._built) return;
+    if (data.presets && typeof data.presets === "object") {
+      this._presets = data.presets;
+      this._renderPresets();
+    }
+    if (data.lastHs) {
+      for (const [entity, hs] of Object.entries(data.lastHs)) {
+        // live state wins; restored values fill in lights that are off now
+        if (this._pins.has(entity) && !this._lastHs.has(entity) && Array.isArray(hs)) {
+          this._lastHs.set(entity, hs.slice(0, 2));
+        }
+      }
+    }
+    if (data.lastBrightness) {
+      for (const [entity, pct] of Object.entries(data.lastBrightness)) {
+        if (this._pins.has(entity) && !this._lastBrightness.has(entity)) {
+          this._lastBrightness.set(entity, pct);
+        }
+      }
+    }
+    if (Array.isArray(data.clusters)) {
+      // restored stacks are re-validated by the stray check: members whose
+      // live color moved away since last session pop back out on their own
+      this._clusters = data.clusters
+        .map((c) => ({
+          members: (c.members || []).filter((id) => this._pins.has(id)),
+          hs: Array.isArray(c.hs) ? c.hs.slice(0, 2) : null,
+        }))
+        .filter((c) => c.members.length >= 2 && c.hs);
+    }
+    this._updateAll();
+  }
+
+  _scheduleSave() {
+    clearTimeout(this._saveTimer);
+    this._saveTimer = setTimeout(() => this._saveStore(), 2000);
+  }
+
+  _saveStore() {
+    this._saveTimer = null;
+    if (!this._lights) return;
+    const value = {
+      v: 1,
+      clusters: this._clusters.map((c) => ({ members: [...c.members], hs: c.hs })),
+      lastHs: Object.fromEntries(this._lastHs),
+      lastBrightness: Object.fromEntries(this._lastBrightness),
+      presets: this._presets,
+    };
+    try {
+      localStorage.setItem(this._localKey(), JSON.stringify(value));
+    } catch (e) {
+      /* storage full or unavailable */
+    }
+    if (this._hass) {
+      this._hass
+        .callWS({ type: "frontend/set_user_data", key: this._storeKey(), value })
+        .catch(() => {});
+    }
+  }
+
   /* ------------------------------------------------------------ presets */
-
-  _storageKey() {
-    const ids = this._lights.map((l) => l.entity).sort().join(",");
-    return `hue-color-wheel-card:presets:${ids}`;
-  }
-
-  _loadPresets() {
-    try {
-      return JSON.parse(localStorage.getItem(this._storageKey())) || {};
-    } catch (e) {
-      return {};
-    }
-  }
-
-  _persistPresets() {
-    try {
-      localStorage.setItem(this._storageKey(), JSON.stringify(this._presets));
-    } catch (e) {
-      // storage full or unavailable; preset still works for this session
-    }
-  }
 
   _capturePreset(name) {
     const snapshot = {};
@@ -1033,13 +1150,13 @@ class HueColorWheelCard extends HTMLElement {
       };
     }
     this._presets[name] = snapshot;
-    this._persistPresets();
+    this._scheduleSave();
     this._renderPresets();
   }
 
   _deletePreset(name) {
     delete this._presets[name];
-    this._persistPresets();
+    this._scheduleSave();
     this._renderPresets();
   }
 
@@ -1051,6 +1168,7 @@ class HueColorWheelCard extends HTMLElement {
     this._selectedCluster = null;
     this._multi.clear();
     this._refreshClusterStyles();
+    this._scheduleSave();
     for (const [entity, saved] of Object.entries(snapshot)) {
       const pin = this._pins.get(entity);
       if (!pin || pin.el.classList.contains("unavailable")) continue;
@@ -1111,7 +1229,10 @@ class HueColorWheelCard extends HTMLElement {
       this._brightnessLabel.textContent =
         pin?.cfg.label || stateObj?.attributes.friendly_name || entity;
       const b = stateObj?.attributes.brightness;
-      this._slider.value = b != null ? Math.max(1, Math.round((b / 255) * 100)) : 100;
+      this._slider.value =
+        b != null
+          ? Math.max(1, Math.round((b / 255) * 100))
+          : this._lastBrightness.get(entity) ?? 100;
       return;
     } else if (this._selectedCluster) {
       this._brightnessLabel.textContent = `Group (${targets.size} lights)`;

@@ -133,16 +133,21 @@ Either `lights` or `auto_entities` is required.
 - Works with `hs` and `xy` color-mode lights — Home Assistant exposes
   `hs_color` for both and converts on the way in.
 - Light groups/zones behave as a single pin.
-- Off lights have no `hs_color` attribute, so their pin sits at the last
-  color seen this session (or the wheel center until first seen on).
-- Presets are stored in the browser's `localStorage`, keyed by the card's
-  set of lights — they are per device/browser, not synced through Home
-  Assistant. If you need automation-accessible scenes, save the same look
-  as a native HA scene; presets here are meant for quick dashboard recall.
+- Off lights have no `hs_color` attribute, so their pin sits at the
+  last-known color, which is persisted (see Persistence below) — or the
+  wheel center if the light has never been seen on.
+- Presets aren't HA scene entities, so they're not visible to automations.
+  If you need automation-accessible scenes, save the same look as a native
+  HA scene; presets here are meant for quick dashboard recall.
 - During a group drag, the per-light call throttle widens with the group
   size so the total WebSocket call rate stays roughly constant.
-- Merged stacks live in card memory for the session. A stack dissolves on
-  its own if a member turns off or something external (automation, Hue
-  app) moves a member's color visibly away from the stack. Because a
-  tap on a stack splits it, use the global slider (or split first) to
-  change a stack's brightness.
+- **Persistence**: merged stacks, presets, and each light's last-known
+  color and brightness are saved to Home Assistant's per-user frontend
+  storage, so they survive reloads and follow you across pages, browsers,
+  and devices (per HA user). The browser's `localStorage` is kept in sync
+  as a fallback for older HA versions, and presets saved by pre-0.4
+  versions of the card are migrated automatically.
+- A stack dissolves on its own if a member turns off or something
+  external (automation, Hue app) moves a member's color visibly away
+  from the stack. Tap a stack once to control its brightness as a group;
+  tap it again to split it.
