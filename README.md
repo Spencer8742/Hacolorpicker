@@ -73,6 +73,7 @@ show_labels: true        # show labels under pins, default true
 show_presets: true       # show the preset save button and chips, default true
 pin_size: 36             # pin diameter in px, default 36
 merge_ring_size: 3       # thickness of the white merge highlight ring in px, default 3
+merge_distance: 36       # px between pin centers to trigger a merge, default = pin_size
 ```
 
 Entries in `lights` may also be plain entity IDs:
@@ -107,6 +108,7 @@ must match.
 | `show_presets` | bool | `true` | Show the preset save button and preset chips. |
 | `pin_size` | number | `36` | Pin diameter in px (touch target is at least 44 px regardless). |
 | `merge_ring_size` | number | `3` | Thickness in px of the white ring that highlights a pin while another pin is dragged over it to merge. |
+| `merge_distance` | number | `pin_size` | Distance in px between pin centers at which a drag snaps into a merge. Larger values make pins easier to combine (and keep them merged until they drift further apart). |
 
 Either `lights` or `auto_entities` is required.
 
