@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.4.1";
+const CARD_VERSION = "0.4.2";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -25,7 +25,9 @@ const DEFAULTS = {
 };
 
 const SERVICE_THROTTLE_MS = 150; // ~6-7 calls/sec max while dragging
-const TAP_SLOP_PX = 6; // movement below this counts as a tap, not a drag
+// generous tap slop accounts for finger jitter on mobile — a strict 6px
+// threshold causes touch taps to occasionally register as drags
+const TAP_SLOP_PX = 10;
 
 const COLOR_MODES_WHEEL = ["hs", "xy", "rgb", "rgbw", "rgbww"];
 
@@ -163,6 +165,9 @@ class HueColorWheelCard extends HTMLElement {
       this._resizeObserver.disconnect();
       this._resizeObserver = null;
     }
+    // detach any in-flight drag's window listeners so we don't leak them
+    if (this._drag && this._drag.cleanup) this._drag.cleanup();
+    this._drag = null;
     for (const p of this._pendingCalls.values()) clearTimeout(p.timer);
     this._pendingCalls.clear();
     clearTimeout(this._animTimer);
@@ -247,7 +252,13 @@ class HueColorWheelCard extends HTMLElement {
           max-width: ${cfg.wheel_size}px;
           aspect-ratio: 1 / 1;
           margin: 0 auto;
+          /* prevent the page from scrolling/zooming when a pin is dragged
+             on touch devices — applied to every layer that can receive a
+             touch so iOS Safari doesn't fall back to default gestures */
           touch-action: none;
+          -webkit-user-select: none;
+          user-select: none;
+          -webkit-touch-callout: none;
         }
         canvas {
           position: absolute;
@@ -256,9 +267,10 @@ class HueColorWheelCard extends HTMLElement {
           height: 100%;
           border-radius: 50%;
           box-shadow: 0 0 0 1px rgba(255,255,255,0.08), 0 4px 24px rgba(0,0,0,0.4);
+          touch-action: none;
         }
         /* let empty-area taps fall through to the canvas; pins re-enable hits */
-        .pins { position: absolute; inset: 0; pointer-events: none; }
+        .pins { position: absolute; inset: 0; pointer-events: none; touch-action: none; }
         .pin {
           position: absolute;
           left: 0; top: 0;
@@ -709,9 +721,11 @@ class HueColorWheelCard extends HTMLElement {
   _onPinDown(ev, entity) {
     const pin = this._pins.get(entity);
     if (!pin || pin.el.classList.contains("unavailable")) return;
+    // ignore non-primary touches (a second finger landing mid-drag would
+    // otherwise hijack the gesture on mobile)
+    if (this._drag) return;
     ev.preventDefault();
     ev.stopPropagation();
-    pin.el.setPointerCapture(ev.pointerId);
 
     // dragging a selected pin moves the whole selection together; cluster
     // members always come along with their stack
@@ -736,6 +750,37 @@ class HueColorWheelCard extends HTMLElement {
       startXy.set(id, hsToXy(hs[0], hs[1], this._radius));
     }
 
+    // Mobile / iOS Safari shadow-DOM note: setPointerCapture and listeners
+    // attached to the pin element do not reliably deliver pointermove once
+    // the finger leaves the pin's bounds (especially inside a custom
+    // element). Attaching the drag listeners to window — and passing
+    // { passive: false } so we can suppress page scroll — is the robust
+    // pattern that works across desktop, iOS Safari, and the HA Companion
+    // app's webview.
+    const onMove = (e) => {
+      if (!this._drag || e.pointerId !== this._drag.pointerId) return;
+      e.preventDefault();
+      this._onPinMove(e, entity);
+    };
+    const onUp = (e) => {
+      if (!this._drag || e.pointerId !== this._drag.pointerId) return;
+      cleanup();
+      this._onPinUp(e, entity);
+    };
+    const onCancel = (e) => {
+      if (!this._drag || e.pointerId !== this._drag.pointerId) return;
+      cleanup();
+      // OS cancelled the gesture (system swipe, palm rejection, scroll
+      // hijack) — discard the in-flight drag instead of committing a
+      // partial position
+      this._abortDrag();
+    };
+    const cleanup = () => {
+      window.removeEventListener("pointermove", onMove, { passive: false });
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+    };
+
     this._drag = {
       entity,
       members: new Set(group),
@@ -746,18 +791,26 @@ class HueColorWheelCard extends HTMLElement {
       moved: false,
       mergeTarget: null,
       lastHs: new Map(),
+      cleanup,
     };
 
-    const onMove = (e) => this._onPinMove(e, entity);
-    const onUp = (e) => {
-      pin.el.removeEventListener("pointermove", onMove);
-      pin.el.removeEventListener("pointerup", onUp);
-      pin.el.removeEventListener("pointercancel", onUp);
-      this._onPinUp(e, entity);
-    };
-    pin.el.addEventListener("pointermove", onMove);
-    pin.el.addEventListener("pointerup", onUp);
-    pin.el.addEventListener("pointercancel", onUp);
+    window.addEventListener("pointermove", onMove, { passive: false });
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+  }
+
+  _abortDrag() {
+    const drag = this._drag;
+    if (!drag) return;
+    this._drag = null;
+    for (const id of drag.members) {
+      this._pins.get(id)?.el.classList.remove("dragging");
+    }
+    if (drag.mergeTarget) {
+      this._pins.get(drag.mergeTarget)?.el.classList.remove("merge-target");
+    }
+    // snap pins back to where state thinks they are
+    this._positionAllPins();
   }
 
   _onPinMove(ev, entity) {
