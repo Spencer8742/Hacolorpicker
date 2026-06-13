@@ -20,8 +20,10 @@ time. No build step, no dependencies — a single JS file.
 - **Merge by drop (like the Hue app)**: drag a pin onto another pin — the
   target highlights while you hover, and dropping snaps them into a single
   stacked pin with a count badge. The stack drags as one unit and all its
-  lights share one color. Tap the stack to split it back apart (the pins
-  fan out with a smooth animation).
+  lights share one color. **Tap the stack to open it into a ring** (a Hue-
+  style "well" with the member pins around the rim); **drag a pin out of the
+  ring to remove just that light** from the group, while the rest stay
+  grouped. Tap the empty wheel to close the ring.
 - **Multi-select & group drag**: tap several pins to select them, then drag
   any selected pin — the whole group moves together, keeping its relative
   arrangement on the wheel. The brightness slider applies to the selection.
@@ -145,7 +147,10 @@ Either `lights` or `auto_entities` is required.
 | ------- | ------ |
 | Drag a pin | Live color change for that light (`hs_color`), throttled during drag |
 | Drop a pin onto another pin | Merge them into a stacked pin (badge shows the count); the stack moves as one |
-| Tap a stacked pin | Split the stack — pins fan back out around the spot |
+| Tap a stacked pin | Open it into a ring (well) with the members around the rim |
+| Drag a pin out of the ring | Remove just that light from the group at the dropped color |
+| Drag a pin back into the ring | Keep it in the group |
+| Tap the empty wheel | Close the ring |
 | Tap an on light's pin | Toggle it in/out of the selection (selected pins show a ring) |
 | Tap several pins, then drag one | The whole selection moves together as a group |
 | Tap an off light's pin | Turn it on |
@@ -193,5 +198,6 @@ Either `lights` or `auto_entities` is required.
     load.
 - A stack dissolves on its own if a member turns off or something
   external (automation, Hue app) moves a member's color visibly away
-  from the stack. Tap a stack once to control its brightness as a group;
-  tap it again to split it.
+  from the stack. Tap a stack to open its ring — the whole group is
+  selected for the brightness slider while open — and drag individual pins
+  out of the ring to remove them.
