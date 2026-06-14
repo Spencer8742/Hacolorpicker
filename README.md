@@ -14,6 +14,22 @@ time. No build step, no dependencies — a single JS file.
   cool blue-white at the bottom). In white mode, dragging a pin up/down sets
   the light's `color_temp` instead of `hs_color`. Color-temp-only lights
   (which can't show on the color wheel) become draggable in white mode.
+- **Effects**: when any light advertises effects, a third pill appears that
+  opens an effects chooser (applies `light.turn_on` with `effect`).
+- **Teardrop pins with icons** tinted to each light's color; labels are
+  auto-decluttered (only the selected, dragged, or grouped pins show a name).
+- **Quick-color swatches** + a randomize button below the wheel; tap a swatch
+  to apply it to the selection (or all on lights).
+- **Tap-to-place**: with pins selected, tap anywhere on the wheel to send them
+  to that color/temperature without dragging.
+- **Long-press a pin or stack** for a popover: power on/off, a per-light (or
+  per-group) brightness slider, **rename a group**, ungroup, or open Home
+  Assistant's native more-info dialog.
+- **Live readout** of the value while dragging, the wheel dims to track the
+  lights' brightness, gentle haptics on merge/long-press, and the brightness
+  slider shows a percentage.
+- **Predefined groups** via the `groups:` config option, always present and
+  named, on top of the runtime merge-by-drop grouping.
 - One labeled pin per configured light, positioned at its current
   `hs_color` and filled with its actual current color (`rgb_color`).
 - Drag a pin (mouse or touch) to call `light.turn_on` with the new
@@ -106,14 +122,30 @@ lights:
   - entity: light.office_lamp
     label: Office Lamp
 # Optional settings:
+title: Patio             # card header text; omit to auto-use the area name, or set false to hide
+icon: mdi:lightbulb-group  # header icon, default mdi:lightbulb-group
 wheel_size: 300          # wheel diameter in px (max; scales down responsively), default 300
 show_brightness: true    # show the brightness slider, default true
-show_labels: true        # show labels under pins, default true
+show_labels: true        # show labels (auto-decluttered: only selected/group/dragged pins), default true
 show_presets: true       # show the preset save button and chips, default true
 show_white_toggle: true  # show the color/white (temperature) mode toggle, default true
+show_swatches: true      # show the quick-color swatch row + randomize button, default true
+show_effects: true       # show the effects toggle when lights support effects, default true
+enable_haptics: true     # vibrate on merge / long-press on supported devices, default true
+swatches:                # optional custom quick-colors as [hue, saturation] pairs
+  - [0, 100]
+  - [40, 100]
+  - [210, 90]
 pin_size: 36             # pin diameter in px, default 36
 merge_ring_size: 3       # thickness of the white merge highlight ring in px, default 3
 merge_distance: 36       # px between pin centers to trigger a merge, default = pin_size
+
+# Optional predefined groups (always present, named):
+groups:
+  - name: Patio Cans
+    entities:
+      - light.patio_can_1
+      - light.patio_can_2
 ```
 
 Entries in `lights` may also be plain entity IDs:
