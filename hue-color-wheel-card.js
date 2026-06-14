@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.10.1";
+const CARD_VERSION = "0.10.2";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -535,11 +535,30 @@ class HueColorWheelCard extends HTMLElement {
         .pin.show-label .pin-label,
         .pin.dragging .pin-label,
         .pin.pressing .pin-label { opacity: 1; }
-        /* inside an open ring, suppress the auto labels and show only the pin
-           you're actually touching, so a dozen names don't pile up */
-        .pins.ring-open .pin.show-label .pin-label { opacity: 0; }
-        .pins.ring-open .pin.dragging .pin-label,
-        .pins.ring-open .pin.pressing .pin-label { opacity: 1; }
+        /* inside an open ring every member's name shows, but each is pushed
+           radially outward (set inline in _layoutExpanded) so they fan out
+           around the well instead of stacking under the pins */
+        .pins.ring-open .pin-label {
+          top: 50%;
+          font-size: 10px;
+          max-width: 84px;
+        }
+        /* the open group's name, centered in the well */
+        .tray-name {
+          position: absolute;
+          left: 0; top: 0;
+          transform: translate(-50%, -50%);
+          max-width: 120px;
+          text-align: center;
+          color: rgba(255,255,255,0.92);
+          font-size: 14px;
+          font-weight: 600;
+          line-height: 1.2;
+          pointer-events: none;
+          text-shadow: 0 1px 3px rgba(0,0,0,0.7);
+          z-index: 1;
+        }
+        .tray-name[hidden] { display: none; }
         .pin-badge {
           display: none;
           position: absolute;
@@ -805,6 +824,7 @@ class HueColorWheelCard extends HTMLElement {
         <div class="wheel-wrap">
           <canvas></canvas>
           <div class="expand-tray" hidden></div>
+          <div class="tray-name" hidden></div>
           <div class="pins"></div>
           <div class="value-readout"></div>
         </div>
@@ -841,6 +861,7 @@ class HueColorWheelCard extends HTMLElement {
     this._wheelWrap = this.shadowRoot.querySelector(".wheel-wrap");
     this._canvas = this.shadowRoot.querySelector("canvas");
     this._trayEl = this.shadowRoot.querySelector(".expand-tray");
+    this._trayNameEl = this.shadowRoot.querySelector(".tray-name");
     this._pinsEl = this.shadowRoot.querySelector(".pins");
     this._readoutEl = this.shadowRoot.querySelector(".value-readout");
     this._modeColorBtn = this.shadowRoot.querySelector(".mode-btn.color");
@@ -1891,6 +1912,12 @@ class HueColorWheelCard extends HTMLElement {
       this._trayEl.style.left = `${r + cx}px`;
       this._trayEl.style.top = `${r + cy}px`;
     }
+    if (this._trayNameEl) {
+      this._trayNameEl.hidden = false;
+      this._trayNameEl.textContent = this._groupName(cluster);
+      this._trayNameEl.style.left = `${r + cx}px`;
+      this._trayNameEl.style.top = `${r + cy}px`;
+    }
     this._selectedCluster = cluster;
     this._multi = new Set(cluster.members);
     this._refreshClusterStyles();
@@ -1906,13 +1933,15 @@ class HueColorWheelCard extends HTMLElement {
     const n = members.length;
     members.forEach((id, i) => {
       const ang = -Math.PI / 2 + (i / n) * 2 * Math.PI; // first slot at top
-      const x = ex.cx + ex.trayR * Math.cos(ang);
-      const y = ex.cy + ex.trayR * Math.sin(ang);
+      const ux = Math.cos(ang);
+      const uy = Math.sin(ang);
+      const x = ex.cx + ex.trayR * ux;
+      const y = ex.cy + ex.trayR * uy;
       ex.slots.set(id, [x, y]);
       if (this._drag && this._drag.members.has(id)) return; // skip the dragged one
       const pin = this._pins.get(id);
       if (!pin) return;
-      pin.el.classList.add("animating");
+      pin.el.classList.add("animating", "show-label");
       pin.el.classList.remove("off", "removing");
       pin.el.style.transform = `translate(${r + x}px, ${r + y}px)`;
       // colour each pin by its own current value so the lights in the ring
@@ -1921,6 +1950,13 @@ class HueColorWheelCard extends HTMLElement {
       pin.circle.style.background = rgbCss(rgb);
       pin.icon.setAttribute("icon", this._pinIcon(id));
       pin.icon.style.color = this._contrastColor(rgb);
+      // fan the name radially outward from the well so names don't stack
+      if (pin.label) {
+        const gap = this._config.pin_size / 2 + 10;
+        pin.label.style.left = "50%";
+        pin.label.style.transform =
+          `translate(-50%, -50%) translate(${ux * gap}px, ${uy * gap}px) translate(${ux * 50}%, 0)`;
+      }
     });
     clearTimeout(this._animTimer);
     this._animTimer = setTimeout(() => {
@@ -1933,8 +1969,16 @@ class HueColorWheelCard extends HTMLElement {
     this._expandedCluster = null;
     this._expand = null;
     this._pinsEl?.classList.remove("ring-open");
-    for (const pin of this._pins.values()) pin.el.classList.remove("pressing");
+    for (const pin of this._pins.values()) {
+      pin.el.classList.remove("pressing");
+      if (pin.label) {
+        // clear the radial label offsets so labels return below the pin
+        pin.label.style.left = "";
+        pin.label.style.transform = "";
+      }
+    }
     if (this._trayEl) this._trayEl.hidden = true;
+    if (this._trayNameEl) this._trayNameEl.hidden = true;
     this._selectedCluster = null;
     this._multi.clear();
     this._refreshClusterStyles();
