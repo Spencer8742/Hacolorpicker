@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.9.0";
+const CARD_VERSION = "0.10.0";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -20,10 +20,21 @@ const DEFAULTS = {
   show_labels: true,
   show_presets: true,
   show_white_toggle: true, // show the color/white (temperature) mode toggle
+  show_swatches: true, // quick-color swatch row + randomize button
+  show_effects: true, // effects toggle (only appears if lights support effects)
+  enable_haptics: true, // light vibration on merge/long-press where supported
   pin_size: 36,
   merge_ring_size: 3,
   merge_distance: null, // px between pin centers to trigger a merge; null = pin_size
 };
+
+const LONG_PRESS_MS = 500;
+
+// default quick-color swatches (hue, saturation)
+const DEFAULT_SWATCHES = [
+  [0, 100], [30, 100], [50, 100], [120, 80], [180, 90],
+  [210, 90], [270, 90], [300, 85], [0, 0],
+];
 
 const SERVICE_THROTTLE_MS = 150; // ~6-7 calls/sec max while dragging
 // generous tap slop accounts for finger jitter on mobile — a strict 6px
@@ -190,6 +201,10 @@ class HueColorWheelCard extends HTMLElement {
     this._radius = 0;
     this._pendingCalls = new Map(); // entity -> {timer, lastSent, pending}
     this._resizeObserver = null;
+    this._longPressTimer = null; // pending long-press -> popover
+    this._popoverFor = null; // entity/cluster the popover targets
+    this._effectsOpen = false;
+    this._seededGroups = false; // declarative groups applied once
   }
 
   setConfig(config) {
@@ -240,6 +255,7 @@ class HueColorWheelCard extends HTMLElement {
     // detach any in-flight drag's window listeners so we don't leak them
     if (this._drag && this._drag.cleanup) this._drag.cleanup();
     this._drag = null;
+    clearTimeout(this._longPressTimer);
     for (const p of this._pendingCalls.values()) clearTimeout(p.timer);
     this._pendingCalls.clear();
     clearTimeout(this._animTimer);
@@ -333,7 +349,18 @@ class HueColorWheelCard extends HTMLElement {
           background: var(--ha-card-background, var(--card-background-color, #1c1c1e));
           padding: 16px;
           box-sizing: border-box;
+          position: relative;
         }
+        .card-header {
+          display: ${cfg.title === false ? "none" : "flex"};
+          align-items: center;
+          gap: 8px;
+          margin: 0 0 12px 2px;
+          font-size: 17px;
+          font-weight: 500;
+          color: var(--primary-text-color, #e1e1e1);
+        }
+        .card-header ha-icon { --mdc-icon-size: 20px; color: var(--secondary-text-color, #9e9e9e); }
         .wheel-wrap {
           position: relative;
           width: 100%;
@@ -354,9 +381,32 @@ class HueColorWheelCard extends HTMLElement {
           width: 100%;
           height: 100%;
           border-radius: 50%;
-          box-shadow: 0 0 0 1px rgba(255,255,255,0.08), 0 4px 24px rgba(0,0,0,0.4);
+          box-shadow: 0 0 0 1px rgba(255,255,255,0.08), 0 4px 24px rgba(0,0,0,0.45);
           touch-action: none;
+          /* brightness of the wheel tracks the lights (set inline) */
+          filter: brightness(1);
+          transition: filter 0.4s ease;
         }
+        /* live numeric readout that fades in while dragging */
+        .value-readout {
+          position: absolute;
+          left: 50%;
+          top: 50%;
+          transform: translate(-50%, -50%);
+          padding: 6px 12px;
+          border-radius: 14px;
+          background: rgba(0,0,0,0.55);
+          color: #fff;
+          font-size: 15px;
+          font-weight: 600;
+          letter-spacing: 0.3px;
+          pointer-events: none;
+          opacity: 0;
+          transition: opacity 0.18s ease;
+          backdrop-filter: blur(4px);
+          -webkit-backdrop-filter: blur(4px);
+        }
+        .value-readout.show { opacity: 1; }
         /* let empty-area taps fall through to the canvas; pins re-enable hits */
         .pins { position: absolute; inset: 0; pointer-events: none; touch-action: none; }
         .pin {
@@ -372,15 +422,16 @@ class HueColorWheelCard extends HTMLElement {
           justify-content: center;
           cursor: grab;
           touch-action: none;
-          transition: transform 0.3s ease;
+          transition: transform 0.45s cubic-bezier(0.34, 1.4, 0.5, 1);
           will-change: transform;
         }
-        .pin.dragging { transition: none; cursor: grabbing; z-index: 10; }
+        .pin.dragging { transition: none; cursor: grabbing; z-index: 30; }
+        .pin.selected { z-index: 20; }
         .pin.selected .pin-circle {
-          box-shadow: 0 0 0 3px var(--primary-color, #03a9f4), 0 2px 6px rgba(0,0,0,0.5);
+          box-shadow: 0 0 0 3px var(--primary-color, #03a9f4), 0 2px 7px rgba(0,0,0,0.55);
         }
-        .pin.off { opacity: 0.45; }
-        .pin.off .pin-circle { filter: grayscale(0.7); }
+        .pin.off { opacity: 0.5; }
+        .pin.off .pin-circle { filter: grayscale(0.6) brightness(0.7); }
         .pin.unavailable { opacity: 0.4; cursor: not-allowed; }
         .pin.cluster-hidden { opacity: 0; pointer-events: none; }
         /* a member dragged clear of the ring will be removed on release */
@@ -392,19 +443,116 @@ class HueColorWheelCard extends HTMLElement {
           position: absolute;
           left: 0; top: 0;
           border-radius: 50%;
-          background: radial-gradient(circle, rgba(38,38,40,0.92), rgba(38,38,40,0.78));
-          box-shadow: inset 0 0 0 2px rgba(255,255,255,0.28), 0 6px 24px rgba(0,0,0,0.5);
+          background: radial-gradient(circle at 50% 38%, rgba(50,50,54,0.78), rgba(28,28,30,0.86));
+          box-shadow: inset 0 0 0 1.5px rgba(255,255,255,0.25), inset 0 8px 20px rgba(0,0,0,0.35), 0 8px 30px rgba(0,0,0,0.5);
+          backdrop-filter: blur(6px);
+          -webkit-backdrop-filter: blur(6px);
           transform: translate(-50%, -50%);
           pointer-events: none;
-          transition: opacity 0.2s ease;
+          transition: opacity 0.22s ease, width 0.25s ease, height 0.25s ease;
           /* sits above the canvas but below the pins (which follow it in the
              DOM) so the light markers and labels are never covered */
         }
         .expand-tray[hidden] { display: none; }
+        .pin.merge-target .pin-circle {
+          transform: scale(1.28);
+          box-shadow: 0 0 0 ${ring}px rgba(255,255,255,0.7), 0 2px 6px rgba(0,0,0,0.5);
+        }
+        /* teardrop marker: round body with a small downward tail at its tip */
+        .pin-circle {
+          position: relative;
+          width: ${pinSize}px;
+          height: ${pinSize}px;
+          border-radius: 50% 50% 50% 50%;
+          border: 2px solid rgba(255,255,255,0.92);
+          box-shadow: 0 2px 7px rgba(0,0,0,0.55);
+          box-sizing: border-box;
+          background: #888;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          color: rgba(255,255,255,0.92);
+          --mdc-icon-size: ${Math.round(pinSize * 0.55)}px;
+          font-size: ${Math.round(pinSize * 0.46)}px;
+          font-weight: 600;
+          text-shadow: 0 1px 2px rgba(0,0,0,0.85);
+          user-select: none;
+          -webkit-user-select: none;
+          transition: background-color 0.3s ease, transform 0.15s ease;
+        }
+        .pin-circle::after {
+          content: "";
+          position: absolute;
+          bottom: -5px;
+          left: 50%;
+          width: 9px;
+          height: 9px;
+          background: inherit;
+          border-right: 2px solid rgba(255,255,255,0.92);
+          border-bottom: 2px solid rgba(255,255,255,0.92);
+          transform: translateX(-50%) rotate(45deg);
+          border-radius: 0 0 3px 0;
+          z-index: -1;
+        }
+        .pin-icon { pointer-events: none; display: inline-flex; }
+        .pin.dragging .pin-circle { transition: none; }
+        .pin.animating { transition: transform 0.7s cubic-bezier(0.25, 0.85, 0.3, 1); }
+        .pin.animating .pin-circle { transition: background-color 0.7s ease; }
+        .pin-label {
+          position: absolute;
+          top: ${hit / 2 + pinSize / 2 + 5}px;
+          left: 50%;
+          transform: translateX(-50%);
+          max-width: 96px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          padding: 1px 7px;
+          border-radius: 9px;
+          background: rgba(20,20,22,0.66);
+          font-size: 11px;
+          color: var(--primary-text-color, #f0f0f0);
+          pointer-events: none;
+          user-select: none;
+          -webkit-user-select: none;
+          opacity: 0;
+          transition: opacity 0.18s ease;
+        }
+        /* de-clutter: labels appear only for the selected / dragged / ring
+           pins (and collapsed group reps); everything else stays clean */
+        .pin.show-label .pin-label { opacity: 1; }
+        .pin-badge {
+          display: none;
+          position: absolute;
+          top: ${(hit - pinSize) / 2 - 5}px;
+          right: ${(hit - pinSize) / 2 - 5}px;
+          min-width: 16px;
+          height: 16px;
+          padding: 0 3px;
+          box-sizing: border-box;
+          border-radius: 8px;
+          background: #fff;
+          color: #000;
+          font-size: 10px;
+          font-weight: 700;
+          align-items: center;
+          justify-content: center;
+          box-shadow: 0 1px 3px rgba(0,0,0,0.5);
+          pointer-events: none;
+          z-index: 2;
+        }
+        .pin-badge.show { display: flex; }
+        .toolbar {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 10px;
+          margin-top: 16px;
+          flex-wrap: wrap;
+        }
         .mode-toggle {
           display: ${cfg.show_white_toggle ? "inline-flex" : "none"};
           gap: 2px;
-          margin: 14px auto 0;
           padding: 3px;
           border-radius: 22px;
           background: rgba(255,255,255,0.08);
@@ -421,6 +569,7 @@ class HueColorWheelCard extends HTMLElement {
           display: inline-flex;
           align-items: center;
           justify-content: center;
+          color: var(--primary-text-color, #e1e1e1);
         }
         .mode-btn .swatch {
           width: 24px;
@@ -435,84 +584,75 @@ class HueColorWheelCard extends HTMLElement {
         .mode-btn.white .swatch {
           background: linear-gradient(180deg, #ffb15e, #fff3e0 50%, #cfe4ff);
         }
+        .mode-btn.fx { display: none; --mdc-icon-size: 20px; }
+        .mode-btn.fx.available { display: inline-flex; }
         .mode-btn.active { background: rgba(255,255,255,0.22); }
-        .pin.merge-target .pin-circle {
-          transform: scale(1.25);
-          box-shadow: 0 0 0 ${ring}px rgba(255,255,255,0.7), 0 2px 6px rgba(0,0,0,0.5);
+        .swatches {
+          display: ${cfg.show_swatches === false ? "none" : "flex"};
+          align-items: center;
+          gap: 7px;
+          flex-wrap: wrap;
+          justify-content: center;
+          margin-top: 14px;
         }
-        .pin-circle {
-          width: ${pinSize}px;
-          height: ${pinSize}px;
+        .swatch-btn {
+          width: 24px;
+          height: 24px;
           border-radius: 50%;
-          border: 2px solid rgba(255,255,255,0.9);
-          box-shadow: 0 2px 6px rgba(0,0,0,0.5);
-          box-sizing: border-box;
-          background: #888;
-          display: flex;
+          border: 2px solid rgba(255,255,255,0.6);
+          padding: 0;
+          cursor: pointer;
+          box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+        }
+        .swatch-btn.rnd {
+          background: conic-gradient(red, yellow, lime, cyan, blue, magenta, red);
+          display: inline-flex;
           align-items: center;
           justify-content: center;
-          font-size: ${Math.round(pinSize * 0.5)}px;
           color: #fff;
-          text-shadow: 0 1px 2px rgba(0,0,0,0.8);
-          user-select: none;
-          -webkit-user-select: none;
-          transition: background-color 0.3s ease, transform 0.15s ease;
+          --mdc-icon-size: 15px;
         }
-        .pin.dragging .pin-circle { transition: none; }
-        .pin.animating { transition: transform 0.7s cubic-bezier(0.25, 0.8, 0.3, 1); }
-        .pin.animating .pin-circle { transition: background-color 0.7s ease; }
-        .pin-label {
-          position: absolute;
-          top: ${hit / 2 + pinSize / 2 + 2}px;
-          left: 50%;
-          transform: translateX(-50%);
-          max-width: 90px;
-          overflow: hidden;
-          text-overflow: ellipsis;
-          white-space: nowrap;
-          font-size: 11px;
-          color: var(--primary-text-color, #e1e1e1);
-          text-shadow: 0 1px 2px rgba(0,0,0,0.8);
-          pointer-events: none;
-          user-select: none;
-          -webkit-user-select: none;
-        }
-        .pin-badge {
+        .effects-panel {
           display: none;
-          position: absolute;
-          top: ${(hit - pinSize) / 2 - 5}px;
-          right: ${(hit - pinSize) / 2 - 5}px;
-          min-width: 16px;
-          height: 16px;
-          padding: 0 3px;
-          box-sizing: border-box;
-          border-radius: 8px;
-          background: #fff;
-          color: #000;
-          font-size: 10px;
-          font-weight: 600;
-          align-items: center;
+          flex-wrap: wrap;
+          gap: 8px;
           justify-content: center;
-          box-shadow: 0 1px 3px rgba(0,0,0,0.5);
-          pointer-events: none;
-          z-index: 2;
+          margin-top: 12px;
         }
-        .pin-badge.show { display: flex; }
+        .effects-panel.open { display: flex; }
+        .effect-chip {
+          font: inherit;
+          font-size: 12px;
+          color: var(--primary-text-color, #e1e1e1);
+          background: rgba(255,255,255,0.08);
+          border: 1px solid rgba(255,255,255,0.15);
+          border-radius: 14px;
+          padding: 5px 11px;
+          cursor: pointer;
+        }
+        .effect-chip:hover { background: rgba(255,255,255,0.16); }
         .brightness {
           display: ${cfg.show_brightness ? "flex" : "none"};
           align-items: center;
           gap: 12px;
           margin-top: 16px;
         }
-        .brightness ha-icon { color: var(--secondary-text-color, #9e9e9e); }
+        .brightness ha-icon { color: var(--secondary-text-color, #9e9e9e); --mdc-icon-size: 20px; }
         .brightness-label {
           font-size: 13px;
           color: var(--secondary-text-color, #9e9e9e);
-          min-width: 70px;
-          max-width: 120px;
+          min-width: 64px;
+          max-width: 130px;
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
+        }
+        .bright-pct {
+          font-size: 13px;
+          font-variant-numeric: tabular-nums;
+          color: var(--secondary-text-color, #9e9e9e);
+          min-width: 34px;
+          text-align: right;
         }
         input[type="range"] {
           flex: 1;
@@ -523,23 +663,23 @@ class HueColorWheelCard extends HTMLElement {
           cursor: pointer;
         }
         input[type="range"]::-webkit-slider-runnable-track {
-          height: 8px;
-          border-radius: 4px;
-          background: linear-gradient(to right, #444, #ffe9b0);
+          height: 10px;
+          border-radius: 5px;
+          background: linear-gradient(to right, #3a3a3a, #ffe9b0);
         }
         input[type="range"]::-webkit-slider-thumb {
           -webkit-appearance: none;
           width: 22px;
           height: 22px;
-          margin-top: -7px;
+          margin-top: -6px;
           border-radius: 50%;
           background: #fff;
-          box-shadow: 0 1px 4px rgba(0,0,0,0.5);
+          box-shadow: 0 1px 5px rgba(0,0,0,0.6);
         }
         input[type="range"]::-moz-range-track {
-          height: 8px;
-          border-radius: 4px;
-          background: linear-gradient(to right, #444, #ffe9b0);
+          height: 10px;
+          border-radius: 5px;
+          background: linear-gradient(to right, #3a3a3a, #ffe9b0);
         }
         input[type="range"]::-moz-range-thumb {
           width: 22px;
@@ -547,7 +687,7 @@ class HueColorWheelCard extends HTMLElement {
           border: none;
           border-radius: 50%;
           background: #fff;
-          box-shadow: 0 1px 4px rgba(0,0,0,0.5);
+          box-shadow: 0 1px 5px rgba(0,0,0,0.6);
         }
         .presets {
           display: ${cfg.show_presets ? "flex" : "none"};
@@ -582,7 +722,7 @@ class HueColorWheelCard extends HTMLElement {
         .save-form { display: inline-flex; align-items: center; gap: 6px; }
         /* author display rules above would defeat the hidden attribute */
         .save-form[hidden], .save-btn[hidden] { display: none; }
-        .save-form input {
+        .save-form input, .pop-rename input {
           font: inherit;
           font-size: 13px;
           color: var(--primary-text-color, #e1e1e1);
@@ -598,20 +738,71 @@ class HueColorWheelCard extends HTMLElement {
           font-size: 12px;
           color: var(--secondary-text-color, #9e9e9e);
         }
+        /* long-press popover for a single light or a group */
+        .pop-backdrop {
+          position: absolute;
+          inset: 0;
+          z-index: 40;
+          background: rgba(0,0,0,0.25);
+        }
+        .pop-backdrop[hidden] { display: none; }
+        .popover {
+          position: absolute;
+          z-index: 41;
+          min-width: 210px;
+          max-width: 260px;
+          padding: 14px;
+          border-radius: 16px;
+          background: var(--card-background-color, #2a2a2c);
+          box-shadow: 0 10px 36px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.06);
+          color: var(--primary-text-color, #e1e1e1);
+          box-sizing: border-box;
+        }
+        .popover[hidden] { display: none; }
+        .pop-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+        .pop-title { font-size: 15px; font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .pop-power {
+          border: none; cursor: pointer; border-radius: 50%;
+          width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center;
+          background: rgba(255,255,255,0.1); color: var(--primary-text-color, #e1e1e1);
+          --mdc-icon-size: 20px;
+        }
+        .pop-power.on { background: var(--primary-color, #f5c518); color: #1a1a1a; }
+        .pop-row { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+        .pop-rename { display: flex; gap: 6px; margin-top: 10px; }
+        .pop-rename input { width: 100%; }
+        .pop-actions { display: flex; gap: 8px; margin-top: 12px; }
+        .pop-btn {
+          flex: 1; font: inherit; font-size: 13px; cursor: pointer;
+          color: var(--primary-text-color, #e1e1e1);
+          background: rgba(255,255,255,0.08);
+          border: 1px solid rgba(255,255,255,0.15);
+          border-radius: 10px; padding: 8px;
+        }
+        .pop-btn:hover { background: rgba(255,255,255,0.16); }
       </style>
       <ha-card>
+        <div class="card-header"><ha-icon icon="${cfg.icon || "mdi:lightbulb-group"}"></ha-icon><span class="hdr-text"></span></div>
         <div class="wheel-wrap">
           <canvas></canvas>
           <div class="expand-tray" hidden></div>
           <div class="pins"></div>
+          <div class="value-readout"></div>
         </div>
-        <div class="mode-toggle">
-          <button class="mode-btn color active" title="Color" aria-label="Color"><span class="swatch"></span></button>
-          <button class="mode-btn white" title="White / temperature" aria-label="White temperature"><span class="swatch"></span></button>
+        <div class="toolbar">
+          <div class="mode-toggle">
+            <button class="mode-btn color active" title="Color"><span class="swatch"></span></button>
+            <button class="mode-btn white" title="White / temperature"><span class="swatch"></span></button>
+            <button class="mode-btn fx" title="Effects"><ha-icon icon="mdi:auto-fix"></ha-icon></button>
+          </div>
         </div>
+        <div class="effects-panel"></div>
+        <div class="swatches"></div>
         <div class="brightness">
+          <ha-icon icon="mdi:brightness-6"></ha-icon>
           <span class="brightness-label">All lights</span>
           <input type="range" min="1" max="100" value="100" aria-label="Brightness">
+          <span class="bright-pct">100%</span>
         </div>
         <div class="presets">
           <span class="chips"></span>
@@ -623,6 +814,8 @@ class HueColorWheelCard extends HTMLElement {
           </span>
         </div>
         <div class="ct-note" hidden></div>
+        <div class="pop-backdrop" hidden></div>
+        <div class="popover" hidden></div>
       </ha-card>
     `;
 
@@ -630,12 +823,22 @@ class HueColorWheelCard extends HTMLElement {
     this._canvas = this.shadowRoot.querySelector("canvas");
     this._trayEl = this.shadowRoot.querySelector(".expand-tray");
     this._pinsEl = this.shadowRoot.querySelector(".pins");
+    this._readoutEl = this.shadowRoot.querySelector(".value-readout");
     this._modeColorBtn = this.shadowRoot.querySelector(".mode-btn.color");
     this._modeWhiteBtn = this.shadowRoot.querySelector(".mode-btn.white");
+    this._modeFxBtn = this.shadowRoot.querySelector(".mode-btn.fx");
+    this._effectsPanel = this.shadowRoot.querySelector(".effects-panel");
+    this._swatchesEl = this.shadowRoot.querySelector(".swatches");
+    this._hdrText = this.shadowRoot.querySelector(".hdr-text");
+    this._popBackdrop = this.shadowRoot.querySelector(".pop-backdrop");
+    this._popover = this.shadowRoot.querySelector(".popover");
     this._modeColorBtn.addEventListener("click", () => this._setMode("color"));
     this._modeWhiteBtn.addEventListener("click", () => this._setMode("white"));
+    this._modeFxBtn.addEventListener("click", () => this._toggleEffectsPanel());
+    this._popBackdrop.addEventListener("pointerdown", () => this._closePopover());
     this._brightnessLabel = this.shadowRoot.querySelector(".brightness-label");
     this._slider = this.shadowRoot.querySelector('input[type="range"]');
+    this._brightPct = this.shadowRoot.querySelector(".bright-pct");
     this._ctNote = this.shadowRoot.querySelector(".ct-note");
 
     this._chipsEl = this.shadowRoot.querySelector(".chips");
@@ -643,18 +846,14 @@ class HueColorWheelCard extends HTMLElement {
     this._saveForm = this.shadowRoot.querySelector(".save-form");
     this._saveInput = this.shadowRoot.querySelector(".save-form input");
 
+    this._hdrText.textContent = this._headerTitle();
+    this._renderSwatches();
+
     this._slider.addEventListener("input", () => this._onBrightnessInput());
     this._wheelWrap.addEventListener("pointerdown", (ev) => {
-      // tap on empty wheel area: close an open ring, else clear the selection
-      if (ev.target === this._canvas) {
-        if (this._expandedCluster) {
-          this._closeCluster();
-          return;
-        }
-        this._multi.clear();
-        this._selectedCluster = null;
-        this._refreshSelection();
-      }
+      // tap on empty wheel area: close a ring, place the current selection at
+      // the tapped point, or clear the selection
+      if (ev.target === this._canvas) this._onWheelTap(ev);
     });
 
     this._saveBtn.addEventListener("click", () => {
@@ -686,6 +885,9 @@ class HueColorWheelCard extends HTMLElement {
       pin.dataset.entity = light.entity;
       const circle = document.createElement("div");
       circle.className = "pin-circle";
+      const icon = document.createElement("ha-icon");
+      icon.className = "pin-icon";
+      circle.appendChild(icon);
       pin.appendChild(circle);
       const badge = document.createElement("div");
       badge.className = "pin-badge";
@@ -698,7 +900,7 @@ class HueColorWheelCard extends HTMLElement {
       }
       pin.addEventListener("pointerdown", (ev) => this._onPinDown(ev, light.entity));
       this._pinsEl.appendChild(pin);
-      this._pins.set(light.entity, { el: pin, circle, badge, label, cfg: light });
+      this._pins.set(light.entity, { el: pin, circle, icon, badge, label, cfg: light });
     }
 
     this._renderPresets();
@@ -707,6 +909,319 @@ class HueColorWheelCard extends HTMLElement {
     this._resizeObserver = new ResizeObserver(() => this._onResize());
     this._resizeObserver.observe(this._wheelWrap);
     this._onResize();
+  }
+
+  _headerTitle() {
+    const cfg = this._config;
+    if (typeof cfg.title === "string") return cfg.title;
+    if (cfg.auto_entities?.area) {
+      const areas = this._hass.areas || {};
+      const a = Object.values(areas).find(
+        (ar) =>
+          ar.area_id === cfg.auto_entities.area ||
+          (ar.name || "").toLowerCase() === String(cfg.auto_entities.area).toLowerCase()
+      );
+      if (a) return a.name;
+    }
+    return "Lights";
+  }
+
+  /* ------------------------------------------------- icons / swatches / fx */
+
+  _pinIcon(entity) {
+    const a = this._hass.states[entity]?.attributes || {};
+    if (a.icon) return a.icon;
+    const modes = a.supported_color_modes || [];
+    // a strip-like light gets a strip icon, everything else a bulb
+    if (a.effect_list && modes.includes("rgbww")) return "mdi:led-strip-variant";
+    return "mdi:lightbulb";
+  }
+
+  _renderSwatches() {
+    if (!this._swatchesEl) return;
+    this._swatchesEl.textContent = "";
+    const list = Array.isArray(this._config.swatches)
+      ? this._config.swatches
+      : DEFAULT_SWATCHES;
+    for (const sw of list) {
+      const hs = Array.isArray(sw) ? sw : [Number(sw) || 0, 100];
+      const btn = document.createElement("button");
+      btn.className = "swatch-btn";
+      btn.style.background = rgbCss(hsv2rgb(hs[0], hs[1] / 100, 1));
+      btn.title = "Apply color";
+      btn.addEventListener("click", () => this._applySwatch(hs));
+      this._swatchesEl.appendChild(btn);
+    }
+    const rnd = document.createElement("button");
+    rnd.className = "swatch-btn rnd";
+    rnd.title = "Randomize";
+    rnd.innerHTML = '<ha-icon icon="mdi:dice-multiple"></ha-icon>';
+    rnd.addEventListener("click", () => this._randomize());
+    this._swatchesEl.appendChild(rnd);
+  }
+
+  /** Apply a fixed hue/sat to the current selection (or all on lights). */
+  _applySwatch(hs) {
+    if (this._mode === "white") this._setMode("color");
+    const targets = this._brightnessTargets();
+    const ids = targets.size ? [...targets] : this._onLightIds();
+    for (const id of ids) {
+      this._lastHs.set(id, hs.slice());
+      this._sendColor(id, hs);
+    }
+    // keep any selected stacks coherent
+    for (const cluster of this._clusters) {
+      if (cluster.members.some((mm) => ids.includes(mm))) cluster.hs = hs.slice();
+    }
+    this._haptic(10);
+    this._scheduleSave();
+    this._updateAll();
+  }
+
+  _randomize() {
+    if (this._mode === "white") this._setMode("color");
+    const targets = this._brightnessTargets();
+    const ids = targets.size ? [...targets] : this._onLightIds();
+    for (const id of ids) {
+      const hs = [Math.round(Math.random() * 360), 70 + Math.round(Math.random() * 30)];
+      this._lastHs.set(id, hs);
+      this._sendColor(id, hs);
+    }
+    this._haptic(15);
+    this._scheduleSave();
+    this._updateAll();
+  }
+
+  _onLightIds() {
+    return [...this._pins.keys()].filter(
+      (e) => this._hass.states[e]?.state === "on"
+    );
+  }
+
+  _allEffects() {
+    const set = new Set();
+    for (const entity of this._pins.keys()) {
+      const list = this._hass.states[entity]?.attributes?.effect_list;
+      if (Array.isArray(list)) list.forEach((e) => e && set.add(e));
+    }
+    return [...set];
+  }
+
+  _toggleEffectsPanel() {
+    this._effectsOpen = !this._effectsOpen;
+    if (this._effectsOpen) this._renderEffects();
+    this._effectsPanel.classList.toggle("open", this._effectsOpen);
+    this._modeFxBtn.classList.toggle("active", this._effectsOpen);
+  }
+
+  _renderEffects() {
+    this._effectsPanel.textContent = "";
+    for (const name of this._allEffects()) {
+      const chip = document.createElement("button");
+      chip.className = "effect-chip";
+      chip.textContent = name;
+      chip.addEventListener("click", () => this._applyEffect(name));
+      this._effectsPanel.appendChild(chip);
+    }
+  }
+
+  /** Apply an effect to the selection (or all on lights that support it). */
+  _applyEffect(name) {
+    const targets = this._brightnessTargets();
+    const base = targets.size ? [...targets] : this._onLightIds();
+    const ids = base.filter((e) =>
+      (this._hass.states[e]?.attributes?.effect_list || []).includes(name)
+    );
+    if (ids.length) {
+      this._hass.callService("light", "turn_on", { entity_id: ids, effect: name });
+      this._haptic(10);
+    }
+  }
+
+  _haptic(ms) {
+    if (!this._config.enable_haptics) return;
+    try {
+      if (navigator && typeof navigator.vibrate === "function") navigator.vibrate(ms);
+    } catch (e) {
+      /* unsupported */
+    }
+  }
+
+  _showReadout(text) {
+    if (!this._readoutEl) return;
+    this._readoutEl.textContent = text;
+    this._readoutEl.classList.add("show");
+  }
+
+  _hideReadout() {
+    this._readoutEl?.classList.remove("show");
+  }
+
+  /** Tap on the empty wheel: close a ring, place a selection, or clear it. */
+  _onWheelTap(ev) {
+    if (this._expandedCluster) {
+      this._closeCluster();
+      return;
+    }
+    const targets = this._brightnessTargets();
+    if (targets.size) {
+      // tap-to-place: send the selected lights to the tapped value
+      const rect = this._wheelWrap.getBoundingClientRect();
+      const r = rect.width / 2;
+      const x = ev.clientX - (rect.left + r);
+      const y = ev.clientY - (rect.top + r);
+      const d = Math.hypot(x, y);
+      const cx = d > r && d > 0 ? (x * r) / d : x;
+      const cy = d > r && d > 0 ? (y * r) / d : y;
+      for (const id of targets) {
+        if (this._mode === "white") {
+          const k = yToTemp(cy, r);
+          this._lastTemp.set(id, k);
+          this._whiteX.set(id, cx);
+          this._sendTemp(id, k);
+        } else {
+          const hs = xyToHs(cx, cy, r);
+          this._lastHs.set(id, hs);
+          this._sendColor(id, hs);
+        }
+      }
+      for (const cluster of this._clusters) {
+        if (cluster.members.every((mm) => targets.has(mm))) {
+          if (this._mode === "white") {
+            cluster.temp = yToTemp(cy, r);
+            cluster.whiteX = cx;
+          } else {
+            cluster.hs = xyToHs(cx, cy, r);
+          }
+        }
+      }
+      this._haptic(10);
+      this._scheduleSave();
+      this._updateAll();
+      return;
+    }
+    this._multi.clear();
+    this._selectedCluster = null;
+    this._refreshSelection();
+  }
+
+  /* ----------------------------------------------- long-press popover */
+
+  /** Open the per-light or per-group control popover for a pin. */
+  _openPopover(entity, isExtract) {
+    const cluster = isExtract ? null : this._clusterFor(entity);
+    const isGroup = !!cluster;
+    const ids = isGroup ? [...cluster.members] : [entity];
+    this._popoverFor = { ids, cluster, entity };
+
+    const title = isGroup
+      ? this._groupName(cluster)
+      : this._pins.get(entity)?.cfg.label ||
+        this._hass.states[entity]?.attributes.friendly_name ||
+        entity;
+    const anyOn = ids.some((e) => this._hass.states[e]?.state === "on");
+    const b = this._groupBrightnessPct(ids);
+
+    const pop = this._popover;
+    pop.innerHTML = `
+      <div class="pop-head">
+        <span class="pop-title"></span>
+        <button class="pop-power ${anyOn ? "on" : ""}" title="Toggle"><ha-icon icon="mdi:power"></ha-icon></button>
+      </div>
+      <div class="pop-row">
+        <ha-icon icon="mdi:brightness-6" style="color:var(--secondary-text-color,#9e9e9e)"></ha-icon>
+        <input class="pop-bright" type="range" min="1" max="100" value="${b}">
+      </div>
+      ${isGroup ? `<div class="pop-rename"><input type="text" maxlength="24" placeholder="Group name"><button class="pop-btn pop-rename-ok">Save</button></div>` : ""}
+      <div class="pop-actions">
+        ${isGroup ? `<button class="pop-btn pop-ungroup">Ungroup</button>` : `<button class="pop-btn pop-details">Details</button>`}
+      </div>
+    `;
+    pop.querySelector(".pop-title").textContent = title;
+    pop.querySelector(".pop-power").addEventListener("click", () => {
+      this._hass.callService("light", anyOn ? "turn_off" : "turn_on", { entity_id: ids });
+      this._haptic(10);
+      this._closePopover();
+    });
+    pop.querySelector(".pop-bright").addEventListener("input", (e) => {
+      const onIds = ids.filter((id) => this._hass.states[id]?.state === "on");
+      this._hass.callService("light", "turn_on", {
+        entity_id: onIds.length ? onIds : ids,
+        brightness_pct: Number(e.target.value),
+      });
+    });
+    if (isGroup) {
+      const nameInput = pop.querySelector(".pop-rename input");
+      nameInput.value = cluster.name || "";
+      const saveName = () => {
+        cluster.name = nameInput.value.trim() || null;
+        this._scheduleSave();
+        this._updateAll();
+        this._closePopover();
+      };
+      pop.querySelector(".pop-rename-ok").addEventListener("click", saveName);
+      nameInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") saveName();
+      });
+      pop.querySelector(".pop-ungroup").addEventListener("click", () => {
+        this._clusters = this._clusters.filter((c) => c !== cluster);
+        this._scheduleSave();
+        this._updateAll();
+        this._closePopover();
+      });
+    } else {
+      pop.querySelector(".pop-details").addEventListener("click", () => {
+        this.dispatchEvent(
+          new CustomEvent("hass-more-info", {
+            detail: { entityId: entity },
+            bubbles: true,
+            composed: true,
+          })
+        );
+        this._closePopover();
+      });
+    }
+
+    pop.hidden = false;
+    this._popBackdrop.hidden = false;
+    this._positionPopover(entity);
+  }
+
+  _positionPopover(entity) {
+    const pop = this._popover;
+    const card = this.shadowRoot.querySelector("ha-card");
+    const pinEl = this._pins.get(entity)?.el;
+    if (!card || !pinEl) return;
+    const cardR = card.getBoundingClientRect();
+    const pinR = pinEl.getBoundingClientRect();
+    const popW = pop.offsetWidth || 220;
+    const popH = pop.offsetHeight || 160;
+    let left = pinR.left - cardR.left + pinR.width / 2 - popW / 2;
+    left = Math.max(8, Math.min(left, cardR.width - popW - 8));
+    let top = pinR.bottom - cardR.top + 8;
+    if (top + popH > cardR.height) top = pinR.top - cardR.top - popH - 8;
+    top = Math.max(8, top);
+    pop.style.left = `${left}px`;
+    pop.style.top = `${top}px`;
+  }
+
+  _closePopover() {
+    this._popoverFor = null;
+    if (this._popover) this._popover.hidden = true;
+    if (this._popBackdrop) this._popBackdrop.hidden = true;
+  }
+
+  _groupBrightnessPct(ids) {
+    const vals = [];
+    for (const id of ids) {
+      const s = this._hass.states[id];
+      if (s?.state === "on" && s.attributes.brightness != null) {
+        vals.push((s.attributes.brightness / 255) * 100);
+      }
+    }
+    return vals.length
+      ? Math.max(1, Math.round(vals.reduce((a, b) => a + b, 0) / vals.length))
+      : 100;
   }
 
   /* ------------------------------------------------------------ wheel */
@@ -794,6 +1309,14 @@ class HueColorWheelCard extends HTMLElement {
       const what = this._mode === "white" ? "no white/temperature support" : "no color support";
       this._ctNote.textContent = `Not shown (${what}): ${unsupported.join(", ")}`;
     }
+    // effects toggle only appears if some light advertises effects
+    if (this._modeFxBtn) {
+      this._modeFxBtn.classList.toggle(
+        "available",
+        this._config.show_effects && this._allEffects().length > 0
+      );
+    }
+    this._updateWheelBrightness();
     this._refreshClusterStyles();
     this._updateBrightnessUi();
     if (this._clusterDirty) {
@@ -843,29 +1366,45 @@ class HueColorWheelCard extends HTMLElement {
     // never have to rebuild groups after an external change.
     const cluster = this._clusterFor(entity);
 
+    const collapsedRep =
+      cluster && cluster !== this._expandedCluster && cluster.members[0] === entity;
+    const ringMember = cluster && cluster === this._expandedCluster;
+
     if (pin.label) {
       const own = pin.cfg.label || (exists && stateObj.attributes.friendly_name) || entity;
-      // open ring: each pin shows its own name; collapsed stack: "Group N"
-      pin.label.textContent =
-        cluster && cluster !== this._expandedCluster && cluster.members[0] === entity
-          ? this._groupName(cluster)
-          : own;
+      // open ring: each pin shows its own name; collapsed stack: group name
+      pin.label.textContent = collapsedRep ? this._groupName(cluster) : own;
+      // de-clutter: only selected / ring / collapsed-group pins show a label
+      pin.el.classList.toggle(
+        "show-label",
+        this._multi.has(entity) || ringMember || collapsedRep
+      );
     }
 
     if (dragging) return; // don't fight the user's finger
     // a ring member's position is owned by the layout / its extract drag
-    if (cluster && cluster === this._expandedCluster) return;
+    if (ringMember) return;
 
     const [x, y] = this._pinXY(entity, cluster);
     pin.el.style.transform = `translate(${this._radius + x}px, ${this._radius + y}px)`;
 
     if (unavailable) {
       pin.circle.style.background = "#555";
-      pin.circle.textContent = "!";
+      pin.icon.setAttribute("icon", "mdi:alert-circle-outline");
+      pin.icon.style.color = "rgba(255,255,255,0.9)";
     } else {
-      pin.circle.textContent = "";
-      pin.circle.style.background = rgbCss(this._pinRgb(entity, stateObj, cluster));
+      const rgb = this._pinRgb(entity, stateObj, cluster);
+      pin.circle.style.background = rgbCss(rgb);
+      pin.icon.setAttribute("icon", collapsedRep ? "mdi:lightbulb-group" : this._pinIcon(entity));
+      pin.icon.style.color = this._contrastColor(rgb);
     }
+  }
+
+  /** Black or white, whichever reads better on the given rgb fill. */
+  _contrastColor(rgb) {
+    const [r, g, b] = rgb;
+    const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+    return lum > 0.6 ? "rgba(0,0,0,0.7)" : "rgba(255,255,255,0.95)";
   }
 
   _positionPin(pin, hs) {
@@ -890,9 +1429,9 @@ class HueColorWheelCard extends HTMLElement {
     return hsv2rgb(cluster.hs[0], cluster.hs[1] / 100, 1);
   }
 
-  /** Generic label for a collapsed stack, e.g. "Group 2". */
+  /** Custom name if set, else a generic "Group N". */
   _groupName(cluster) {
-    return `Group ${cluster.no || "?"}`;
+    return cluster.name || `Group ${cluster.no || "?"}`;
   }
 
   /** Wheel-local [x, y] for a pin in the current mode. */
@@ -1050,6 +1589,17 @@ class HueColorWheelCard extends HTMLElement {
       cleanup,
     };
 
+    // hold without moving -> open the per-light/group control popover
+    clearTimeout(this._longPressTimer);
+    this._longPressTimer = setTimeout(() => {
+      if (this._drag && !this._drag.moved && this._drag.entity === entity) {
+        this._haptic(20);
+        const wasExtract = this._drag.extract;
+        this._abortDrag();
+        this._openPopover(entity, wasExtract);
+      }
+    }, LONG_PRESS_MS);
+
     window.addEventListener("pointermove", onMove, { passive: false });
     window.addEventListener("pointerup", onEnd);
     window.addEventListener("pointercancel", onEnd);
@@ -1058,6 +1608,8 @@ class HueColorWheelCard extends HTMLElement {
   _abortDrag() {
     const drag = this._drag;
     if (!drag) return;
+    clearTimeout(this._longPressTimer);
+    this._hideReadout();
     if (drag.cleanup) drag.cleanup();
     this._drag = null;
     for (const id of drag.members) {
@@ -1079,8 +1631,9 @@ class HueColorWheelCard extends HTMLElement {
     if (!drag.moved) {
       if (Math.sqrt(dxp * dxp + dyp * dyp) < TAP_SLOP_PX) return;
       drag.moved = true;
+      clearTimeout(this._longPressTimer); // a real drag cancels the long-press
       for (const id of drag.members) {
-        this._pins.get(id).el.classList.add("dragging");
+        this._pins.get(id).el.classList.add("dragging", "show-label");
       }
     }
     const r = this._radius;
@@ -1142,13 +1695,19 @@ class HueColorWheelCard extends HTMLElement {
       const k = yToTemp(y, r);
       drag.lastTemp.set(id, k);
       this._whiteX.set(id, x);
-      pin.circle.style.background = rgbCss(kelvinToRgb(k));
+      const rgb = kelvinToRgb(k);
+      pin.circle.style.background = rgbCss(rgb);
+      pin.icon.style.color = this._contrastColor(rgb);
       this._throttledColorCall(id, k);
+      if (id === drag.entity) this._showReadout(`${k} K`);
     } else {
       const hs = xyToHs(x, y, r);
       drag.lastHs.set(id, hs);
-      pin.circle.style.background = rgbCss(hsv2rgb(hs[0], hs[1] / 100, 1));
+      const rgb = hsv2rgb(hs[0], hs[1] / 100, 1);
+      pin.circle.style.background = rgbCss(rgb);
+      pin.icon.style.color = this._contrastColor(rgb);
       this._throttledColorCall(id, hs);
+      if (id === drag.entity) this._showReadout(`${Math.round(hs[0])}° · ${Math.round(hs[1])}%`);
     }
   }
 
@@ -1156,11 +1715,14 @@ class HueColorWheelCard extends HTMLElement {
     const drag = this._drag;
     if (!drag || drag.entity !== entity) return;
     this._drag = null;
+    clearTimeout(this._longPressTimer);
+    this._hideReadout();
     for (const id of drag.members) {
       this._pins.get(id).el.classList.remove("dragging");
     }
     if (drag.mergeTarget) {
       this._pins.get(drag.mergeTarget)?.el.classList.remove("merge-target");
+      this._haptic(12); // merge about to happen
     }
 
     if (!drag.moved) {
@@ -1318,10 +1880,13 @@ class HueColorWheelCard extends HTMLElement {
       if (this._drag && this._drag.members.has(id)) return; // skip the dragged one
       const pin = this._pins.get(id);
       if (!pin) return;
-      pin.el.classList.add("animating");
+      pin.el.classList.add("animating", "show-label");
       pin.el.classList.remove("off", "removing");
       pin.el.style.transform = `translate(${r + x}px, ${r + y}px)`;
-      pin.circle.style.background = rgbCss(this._clusterRgb(ex.cluster));
+      const rgb = this._clusterRgb(ex.cluster);
+      pin.circle.style.background = rgbCss(rgb);
+      pin.icon.setAttribute("icon", this._pinIcon(id));
+      pin.icon.style.color = this._contrastColor(rgb);
     });
     clearTimeout(this._animTimer);
     this._animTimer = setTimeout(() => {
@@ -1344,7 +1909,15 @@ class HueColorWheelCard extends HTMLElement {
 
   _refreshSelection() {
     for (const [id, pin] of this._pins) {
-      pin.el.classList.toggle("selected", this._multi.has(id));
+      const sel = this._multi.has(id);
+      pin.el.classList.toggle("selected", sel);
+      if (pin.label) {
+        const cluster = this._clusterFor(id);
+        const ringMember = cluster && cluster === this._expandedCluster;
+        const collapsedRep =
+          cluster && cluster !== this._expandedCluster && cluster.members[0] === id;
+        pin.el.classList.toggle("show-label", sel || ringMember || collapsedRep);
+      }
     }
     this._updateBrightnessUi();
   }
@@ -1662,7 +2235,47 @@ class HueColorWheelCard extends HTMLElement {
     } finally {
       this._restoring = false;
     }
+    this._seedDeclarativeGroups(); // config groups, on top of restored state
     if (this._built) this._updateAll();
+  }
+
+  /** Create any YAML-configured groups that aren't already present. */
+  _seedDeclarativeGroups() {
+    if (this._seededGroups || !Array.isArray(this._config.groups)) return;
+    this._seededGroups = true;
+    let added = false;
+    for (const g of this._config.groups) {
+      const members = (g.entities || g.lights || []).filter((e) => this._pins.has(e));
+      if (members.length < 2) continue;
+      if (members.some((e) => this._clusterFor(e))) continue; // respect existing
+      const hs0 = this._lastHs.get(members[0]);
+      this._clusters.push({
+        members: [...members],
+        hs: Array.isArray(hs0) ? hs0.slice() : [0, 0],
+        temp: this._lastTemp.get(members[0]) || DEFAULT_TEMP_K,
+        no: ++this._groupSeq,
+        name: g.name || null,
+        whiteX: 0,
+        settleUntil: 0,
+      });
+      added = true;
+    }
+    if (added) this._scheduleSave();
+  }
+
+  /** Dim the wheel canvas to roughly track the lights' brightness. */
+  _updateWheelBrightness() {
+    if (!this._canvas) return;
+    const vals = [];
+    for (const entity of this._pins.keys()) {
+      const s = this._hass.states[entity];
+      if (s?.state === "on" && s.attributes.brightness != null) {
+        vals.push(s.attributes.brightness / 255);
+      }
+    }
+    const frac = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 1;
+    // never fully black — keep the wheel readable even at minimum
+    this._canvas.style.filter = `brightness(${(0.45 + 0.55 * frac).toFixed(3)})`;
   }
 
   /**
@@ -1732,6 +2345,7 @@ class HueColorWheelCard extends HTMLElement {
           temp: c.temp || DEFAULT_TEMP_K,
           whiteX: typeof c.whiteX === "number" ? c.whiteX : 0,
           no: c.no || ++this._groupSeq,
+          name: c.name || null,
           settleUntil: Date.now() + CLUSTER_SETTLE_MS,
         }))
         .filter((c) => c.members.length >= 2);
@@ -1752,6 +2366,7 @@ class HueColorWheelCard extends HTMLElement {
         temp: c.temp,
         whiteX: c.whiteX,
         no: c.no,
+        name: c.name,
       })),
       lastHs: Object.fromEntries(this._lastHs),
       lastTemp: Object.fromEntries(this._lastTemp),
@@ -1918,9 +2533,10 @@ class HueColorWheelCard extends HTMLElement {
         b != null
           ? Math.max(1, Math.round((b / 255) * 100))
           : this._lastBrightness.get(entity) ?? 100;
+      this._brightPct.textContent = `${this._slider.value}%`;
       return;
     } else if (this._selectedCluster) {
-      this._brightnessLabel.textContent = `Group (${targets.size} lights)`;
+      this._brightnessLabel.textContent = this._groupName(this._selectedCluster);
     } else {
       this._brightnessLabel.textContent = `${targets.size} lights`;
     }
@@ -1943,6 +2559,7 @@ class HueColorWheelCard extends HTMLElement {
     if (vals.length) {
       this._slider.value = Math.max(1, Math.round(vals.reduce((a, b) => a + b, 0) / vals.length));
     }
+    this._brightPct.textContent = `${this._slider.value}%`;
   }
 
   /** Expanded set of entity IDs the brightness slider should target. */
@@ -1966,6 +2583,7 @@ class HueColorWheelCard extends HTMLElement {
     this._sliderIdleTimer = setTimeout(() => (this._sliderActive = false), 1000);
 
     const pct = Number(this._slider.value);
+    if (this._brightPct) this._brightPct.textContent = `${pct}%`;
     const now = Date.now();
     if (this._lastBrightnessCall && now - this._lastBrightnessCall < SERVICE_THROTTLE_MS) {
       clearTimeout(this._brightnessTrailing);
