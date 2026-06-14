@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.10.0";
+const CARD_VERSION = "0.10.1";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -430,6 +430,12 @@ class HueColorWheelCard extends HTMLElement {
         .pin.selected .pin-circle {
           box-shadow: 0 0 0 3px var(--primary-color, #03a9f4), 0 2px 7px rgba(0,0,0,0.55);
         }
+        /* inside an open ring every member is "selected"; a thin white ring
+           reads far cleaner than a dozen heavy blue halos */
+        .pins.ring-open .pin.selected .pin-circle {
+          box-shadow: 0 0 0 2px rgba(255,255,255,0.92), 0 2px 8px rgba(0,0,0,0.6);
+        }
+        .pin.pressing { z-index: 25; }
         .pin.off { opacity: 0.5; }
         .pin.off .pin-circle { filter: grayscale(0.6) brightness(0.7); }
         .pin.unavailable { opacity: 0.4; cursor: not-allowed; }
@@ -443,10 +449,12 @@ class HueColorWheelCard extends HTMLElement {
           position: absolute;
           left: 0; top: 0;
           border-radius: 50%;
-          background: radial-gradient(circle at 50% 38%, rgba(50,50,54,0.78), rgba(28,28,30,0.86));
-          box-shadow: inset 0 0 0 1.5px rgba(255,255,255,0.25), inset 0 8px 20px rgba(0,0,0,0.35), 0 8px 30px rgba(0,0,0,0.5);
-          backdrop-filter: blur(6px);
-          -webkit-backdrop-filter: blur(6px);
+          /* a frosted lens that dims the wheel under it without going black,
+             so the white-ringed pins read clearly on its rim */
+          background: radial-gradient(circle at 50% 40%, rgba(70,70,76,0.42), rgba(20,20,24,0.62));
+          box-shadow: inset 0 0 0 1.5px rgba(255,255,255,0.22), inset 0 6px 22px rgba(0,0,0,0.3), 0 10px 34px rgba(0,0,0,0.55);
+          backdrop-filter: blur(10px) saturate(0.85);
+          -webkit-backdrop-filter: blur(10px) saturate(0.85);
           transform: translate(-50%, -50%);
           pointer-events: none;
           transition: opacity 0.22s ease, width 0.25s ease, height 0.25s ease;
@@ -507,20 +515,31 @@ class HueColorWheelCard extends HTMLElement {
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
-          padding: 1px 7px;
-          border-radius: 9px;
-          background: rgba(20,20,22,0.66);
+          padding: 2px 8px;
+          border-radius: 10px;
+          background: rgba(8,8,10,0.9);
+          border: 1px solid rgba(255,255,255,0.16);
+          box-shadow: 0 2px 8px rgba(0,0,0,0.5);
           font-size: 11px;
-          color: var(--primary-text-color, #f0f0f0);
+          font-weight: 500;
+          color: #fff;
           pointer-events: none;
           user-select: none;
           -webkit-user-select: none;
           opacity: 0;
           transition: opacity 0.18s ease;
+          z-index: 5;
         }
-        /* de-clutter: labels appear only for the selected / dragged / ring
+        /* de-clutter: labels appear only for the selected / dragged / pressed
            pins (and collapsed group reps); everything else stays clean */
-        .pin.show-label .pin-label { opacity: 1; }
+        .pin.show-label .pin-label,
+        .pin.dragging .pin-label,
+        .pin.pressing .pin-label { opacity: 1; }
+        /* inside an open ring, suppress the auto labels and show only the pin
+           you're actually touching, so a dozen names don't pile up */
+        .pins.ring-open .pin.show-label .pin-label { opacity: 0; }
+        .pins.ring-open .pin.dragging .pin-label,
+        .pins.ring-open .pin.pressing .pin-label { opacity: 1; }
         .pin-badge {
           display: none;
           position: absolute;
@@ -1499,6 +1518,12 @@ class HueColorWheelCard extends HTMLElement {
     const extract =
       this._expandedCluster && this._expandedCluster.members.includes(entity);
 
+    if (extract) {
+      // pressing a ring member surfaces just its name (others stay clean)
+      for (const p of this._pins.values()) p.el.classList.remove("pressing");
+      pin.el.classList.add("pressing");
+    }
+
     let group;
     const startXy = new Map();
     if (extract) {
@@ -1610,6 +1635,7 @@ class HueColorWheelCard extends HTMLElement {
     if (!drag) return;
     clearTimeout(this._longPressTimer);
     this._hideReadout();
+    this._pins.get(drag.entity)?.el.classList.remove("pressing");
     if (drag.cleanup) drag.cleanup();
     this._drag = null;
     for (const id of drag.members) {
@@ -1720,6 +1746,8 @@ class HueColorWheelCard extends HTMLElement {
     for (const id of drag.members) {
       this._pins.get(id).el.classList.remove("dragging");
     }
+    // the pressed name is only up while the finger is down
+    this._pins.get(entity)?.el.classList.remove("pressing");
     if (drag.mergeTarget) {
       this._pins.get(drag.mergeTarget)?.el.classList.remove("merge-target");
       this._haptic(12); // merge about to happen
@@ -1841,8 +1869,12 @@ class HueColorWheelCard extends HTMLElement {
   _openCluster(cluster) {
     if (this._expandedCluster && this._expandedCluster !== cluster) this._closeCluster();
     this._expandedCluster = cluster;
+    this._pinsEl?.classList.add("ring-open");
     const r = this._radius;
-    const trayR = Math.min(Math.max(r * 0.42, 56), 120);
+    // size the well so the members spread comfortably around its rim
+    const n = cluster.members.length;
+    const needed = (n * this._config.pin_size * 1.5) / (2 * Math.PI);
+    const trayR = Math.min(Math.max(r * 0.4, 56, needed), r - this._config.pin_size);
     // centre the well on the stack's value, clamped to stay inside the wheel
     let [cx, cy] = this._clusterXY(cluster);
     const mag = Math.hypot(cx, cy);
@@ -1880,10 +1912,12 @@ class HueColorWheelCard extends HTMLElement {
       if (this._drag && this._drag.members.has(id)) return; // skip the dragged one
       const pin = this._pins.get(id);
       if (!pin) return;
-      pin.el.classList.add("animating", "show-label");
+      pin.el.classList.add("animating");
       pin.el.classList.remove("off", "removing");
       pin.el.style.transform = `translate(${r + x}px, ${r + y}px)`;
-      const rgb = this._clusterRgb(ex.cluster);
+      // colour each pin by its own current value so the lights in the ring
+      // are distinguishable (not a dozen identical white markers)
+      const rgb = this._pinRgb(id, this._hass.states[id], null);
       pin.circle.style.background = rgbCss(rgb);
       pin.icon.setAttribute("icon", this._pinIcon(id));
       pin.icon.style.color = this._contrastColor(rgb);
@@ -1898,6 +1932,8 @@ class HueColorWheelCard extends HTMLElement {
     if (!this._expandedCluster) return;
     this._expandedCluster = null;
     this._expand = null;
+    this._pinsEl?.classList.remove("ring-open");
+    for (const pin of this._pins.values()) pin.el.classList.remove("pressing");
     if (this._trayEl) this._trayEl.hidden = true;
     this._selectedCluster = null;
     this._multi.clear();
