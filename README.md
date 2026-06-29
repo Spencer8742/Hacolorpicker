@@ -14,8 +14,17 @@ time. No build step, no dependencies — a single JS file.
   cool blue-white at the bottom). In white mode, dragging a pin up/down sets
   the light's `color_temp` instead of `hs_color`. Color-temp-only lights
   (which can't show on the color wheel) become draggable in white mode.
-- **Effects**: when any light advertises effects, a third pill appears that
-  opens an effects chooser (applies `light.turn_on` with `effect`).
+- **Effects**: when any light advertises effects, a pill appears that opens an
+  effects chooser (applies `light.turn_on` with `effect`).
+- **Animation engine**: a play-button pill opens an animations panel with
+  **Color cycle**, **Breathe**, **Candle**, **Sunrise**, and **Palette**
+  (cycles through colors you pick). The card drives the animation itself with
+  sparse keyframes + the light `transition` param, so it stays smooth without
+  flooding the WebSocket. Animations target the current selection (or all on
+  lights), have a slow/medium/fast speed, and stop the moment you take manual
+  control. The palette and speed are saved/synced; seed colors with
+  `animation_palette`. Note: the animation runs while the card is open (it's
+  frontend-driven), so closing the dashboard stops it.
 - **Teardrop pins with icons** tinted to each light's color; labels are
   auto-decluttered (only the selected, dragged, or grouped pins show a name).
 - **Quick-color swatches** + a randomize button below the wheel; tap a swatch

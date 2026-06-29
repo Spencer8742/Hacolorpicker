@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.10.2";
+const CARD_VERSION = "0.11.0";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -22,6 +22,7 @@ const DEFAULTS = {
   show_white_toggle: true, // show the color/white (temperature) mode toggle
   show_swatches: true, // quick-color swatch row + randomize button
   show_effects: true, // effects toggle (only appears if lights support effects)
+  show_animations: true, // built-in animation engine panel
   enable_haptics: true, // light vibration on merge/long-press where supported
   pin_size: 36,
   merge_ring_size: 3,
@@ -29,6 +30,12 @@ const DEFAULTS = {
 };
 
 const LONG_PRESS_MS = 500;
+
+// Animation engine: keyframes are sent sparsely and the bulbs fade between
+// them via the light `transition` param, so the WebSocket stays quiet.
+const ANIM_TYPES = ["cycle", "breathe", "candle", "sunrise", "palette"];
+const ANIM_BASE_MS = 2600; // base interval at "medium" speed
+const ANIM_SPEEDS = { slow: 1.7, medium: 1, fast: 0.55 };
 
 // default quick-color swatches (hue, saturation)
 const DEFAULT_SWATCHES = [
@@ -205,6 +212,10 @@ class HueColorWheelCard extends HTMLElement {
     this._popoverFor = null; // entity/cluster the popover targets
     this._effectsOpen = false;
     this._seededGroups = false; // declarative groups applied once
+    this._anim = null; // running animation { type, timer, ... }
+    this._animPalette = []; // [[h,s], ...] colors for the palette animation
+    this._animSpeed = "medium";
+    this._animOpen = false;
   }
 
   setConfig(config) {
@@ -256,6 +267,7 @@ class HueColorWheelCard extends HTMLElement {
     if (this._drag && this._drag.cleanup) this._drag.cleanup();
     this._drag = null;
     clearTimeout(this._longPressTimer);
+    this._stopAnim();
     for (const p of this._pendingCalls.values()) clearTimeout(p.timer);
     this._pendingCalls.clear();
     clearTimeout(this._animTimer);
@@ -818,6 +830,39 @@ class HueColorWheelCard extends HTMLElement {
           border-radius: 10px; padding: 8px;
         }
         .pop-btn:hover { background: rgba(255,255,255,0.16); }
+        .mode-btn.anim { display: ${cfg.show_animations ? "inline-flex" : "none"}; --mdc-icon-size: 20px; }
+        .mode-btn.anim.running { background: var(--primary-color, #03a9f4); color: #fff; }
+        .anim-panel {
+          display: none;
+          flex-direction: column;
+          gap: 10px;
+          align-items: center;
+          margin-top: 12px;
+        }
+        .anim-panel.open { display: flex; }
+        .anim-row { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+        .anim-chip {
+          font: inherit; font-size: 12px; cursor: pointer;
+          color: var(--primary-text-color, #e1e1e1);
+          background: rgba(255,255,255,0.08);
+          border: 1px solid rgba(255,255,255,0.15);
+          border-radius: 14px; padding: 6px 12px;
+          display: inline-flex; align-items: center; gap: 5px;
+          --mdc-icon-size: 16px;
+        }
+        .anim-chip:hover { background: rgba(255,255,255,0.16); }
+        .anim-chip.active { background: var(--primary-color, #03a9f4); color: #fff; border-color: transparent; }
+        .anim-chip.stop { color: #ff6b6b; }
+        .anim-speeds { display: flex; gap: 4px; align-items: center; }
+        .anim-speed { font-size: 11px; padding: 4px 9px; border-radius: 12px; cursor: pointer;
+          background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); color: var(--secondary-text-color,#9e9e9e); }
+        .anim-speed.active { background: rgba(255,255,255,0.2); color: var(--primary-text-color,#e1e1e1); }
+        .anim-pal { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: center; }
+        .anim-pal-label { font-size: 11px; color: var(--secondary-text-color,#9e9e9e); margin-right: 2px; }
+        .anim-pal-chip { width: 22px; height: 22px; border-radius: 50%; border: 2px solid rgba(255,255,255,0.6); cursor: pointer; padding: 0; }
+        .anim-pal-add { width: 22px; height: 22px; border-radius: 50%; border: 1px dashed rgba(255,255,255,0.4);
+          background: transparent; color: var(--secondary-text-color,#9e9e9e); cursor: pointer; padding: 0; font-size: 15px; line-height: 1; }
+        .anim-hint { font-size: 10px; color: var(--secondary-text-color,#9e9e9e); }
       </style>
       <ha-card>
         <div class="card-header"><ha-icon icon="${cfg.icon || "mdi:lightbulb-group"}"></ha-icon><span class="hdr-text"></span></div>
@@ -833,7 +878,13 @@ class HueColorWheelCard extends HTMLElement {
             <button class="mode-btn color active" title="Color"><span class="swatch"></span></button>
             <button class="mode-btn white" title="White / temperature"><span class="swatch"></span></button>
             <button class="mode-btn fx" title="Effects"><ha-icon icon="mdi:auto-fix"></ha-icon></button>
+            <button class="mode-btn anim" title="Animations"><ha-icon icon="mdi:play-circle-outline"></ha-icon></button>
           </div>
+        </div>
+        <div class="anim-panel">
+          <div class="anim-row anim-types"></div>
+          <div class="anim-pal"></div>
+          <div class="anim-speeds"></div>
         </div>
         <div class="effects-panel"></div>
         <div class="swatches"></div>
@@ -872,9 +923,15 @@ class HueColorWheelCard extends HTMLElement {
     this._hdrText = this.shadowRoot.querySelector(".hdr-text");
     this._popBackdrop = this.shadowRoot.querySelector(".pop-backdrop");
     this._popover = this.shadowRoot.querySelector(".popover");
+    this._modeAnimBtn = this.shadowRoot.querySelector(".mode-btn.anim");
+    this._animPanel = this.shadowRoot.querySelector(".anim-panel");
+    this._animTypesEl = this.shadowRoot.querySelector(".anim-types");
+    this._animPalEl = this.shadowRoot.querySelector(".anim-pal");
+    this._animSpeedsEl = this.shadowRoot.querySelector(".anim-speeds");
     this._modeColorBtn.addEventListener("click", () => this._setMode("color"));
     this._modeWhiteBtn.addEventListener("click", () => this._setMode("white"));
     this._modeFxBtn.addEventListener("click", () => this._toggleEffectsPanel());
+    this._modeAnimBtn.addEventListener("click", () => this._toggleAnimPanel());
     this._popBackdrop.addEventListener("pointerdown", () => this._closePopover());
     this._brightnessLabel = this.shadowRoot.querySelector(".brightness-label");
     this._slider = this.shadowRoot.querySelector('input[type="range"]');
@@ -1002,6 +1059,7 @@ class HueColorWheelCard extends HTMLElement {
 
   /** Apply a fixed hue/sat to the current selection (or all on lights). */
   _applySwatch(hs) {
+    this._stopAnim();
     if (this._mode === "white") this._setMode("color");
     const targets = this._brightnessTargets();
     const ids = targets.size ? [...targets] : this._onLightIds();
@@ -1019,6 +1077,7 @@ class HueColorWheelCard extends HTMLElement {
   }
 
   _randomize() {
+    this._stopAnim();
     if (this._mode === "white") this._setMode("color");
     const targets = this._brightnessTargets();
     const ids = targets.size ? [...targets] : this._onLightIds();
@@ -1078,6 +1137,227 @@ class HueColorWheelCard extends HTMLElement {
     }
   }
 
+  /* ------------------------------------------------- animation engine */
+
+  _toggleAnimPanel() {
+    this._animOpen = !this._animOpen;
+    if (this._animOpen) this._renderAnimPanel();
+    this._animPanel.classList.toggle("open", this._animOpen);
+    this._modeAnimBtn.classList.toggle("active", this._animOpen);
+  }
+
+  _renderAnimPanel() {
+    const labels = {
+      cycle: ["mdi:rotate-right", "Color cycle"],
+      breathe: ["mdi:waveform", "Breathe"],
+      candle: ["mdi:candle", "Candle"],
+      sunrise: ["mdi:weather-sunset-up", "Sunrise"],
+      palette: ["mdi:palette", "Palette"],
+    };
+    this._animTypesEl.textContent = "";
+    for (const type of ANIM_TYPES) {
+      const chip = document.createElement("button");
+      chip.className = "anim-chip" + (this._anim?.type === type ? " active" : "");
+      chip.innerHTML = `<ha-icon icon="${labels[type][0]}"></ha-icon>${labels[type][1]}`;
+      chip.addEventListener("click", () =>
+        this._anim?.type === type ? this._stopAnim() : this._startAnim(type)
+      );
+      this._animTypesEl.appendChild(chip);
+    }
+    const stop = document.createElement("button");
+    stop.className = "anim-chip stop";
+    stop.innerHTML = `<ha-icon icon="mdi:stop"></ha-icon>Stop`;
+    stop.addEventListener("click", () => this._stopAnim());
+    this._animTypesEl.appendChild(stop);
+
+    this._animSpeedsEl.textContent = "";
+    const spLabel = document.createElement("span");
+    spLabel.className = "anim-pal-label";
+    spLabel.textContent = "Speed";
+    this._animSpeedsEl.appendChild(spLabel);
+    for (const s of Object.keys(ANIM_SPEEDS)) {
+      const b = document.createElement("button");
+      b.className = "anim-speed" + (this._animSpeed === s ? " active" : "");
+      b.textContent = s;
+      b.addEventListener("click", () => this._setAnimSpeed(s));
+      this._animSpeedsEl.appendChild(b);
+    }
+    this._renderAnimPalette();
+  }
+
+  _renderAnimPalette() {
+    this._animPalEl.textContent = "";
+    const label = document.createElement("span");
+    label.className = "anim-pal-label";
+    label.textContent = "Palette";
+    this._animPalEl.appendChild(label);
+    this._animPalette.forEach((hs, i) => {
+      const chip = document.createElement("button");
+      chip.className = "anim-pal-chip";
+      chip.style.background = rgbCss(hsv2rgb(hs[0], hs[1] / 100, 1));
+      chip.title = "Remove";
+      chip.addEventListener("click", () => {
+        this._animPalette.splice(i, 1);
+        this._scheduleSave();
+        this._renderAnimPalette();
+      });
+      this._animPalEl.appendChild(chip);
+    });
+    const add = document.createElement("button");
+    add.className = "anim-pal-add";
+    add.textContent = "+";
+    add.title = "Add the selected light's color (or pick a swatch)";
+    add.addEventListener("click", () => this._addAnimColor());
+    this._animPalEl.appendChild(add);
+    // quick-add from the configured swatches
+    const list = Array.isArray(this._config.swatches) ? this._config.swatches : DEFAULT_SWATCHES;
+    for (const sw of list) {
+      const hs = Array.isArray(sw) ? sw : [Number(sw) || 0, 100];
+      const b = document.createElement("button");
+      b.className = "anim-pal-chip";
+      b.style.opacity = "0.5";
+      b.style.background = rgbCss(hsv2rgb(hs[0], hs[1] / 100, 1));
+      b.title = "Add to palette";
+      b.addEventListener("click", () => {
+        this._animPalette.push([hs[0], hs[1]]);
+        this._scheduleSave();
+        this._renderAnimPalette();
+      });
+      this._animPalEl.appendChild(b);
+    }
+  }
+
+  /** Add the current selection's color (first selected on-light) to the palette. */
+  _addAnimColor() {
+    const sel = [...this._brightnessTargets()];
+    let hs = null;
+    for (const id of sel) {
+      if (this._lastHs.has(id)) {
+        hs = this._lastHs.get(id).slice();
+        break;
+      }
+    }
+    if (!hs) hs = [Math.round(Math.random() * 360), 90];
+    this._animPalette.push(hs);
+    this._scheduleSave();
+    this._renderAnimPalette();
+  }
+
+  _setAnimSpeed(s) {
+    this._animSpeed = s;
+    this._scheduleSave();
+    if (this._anim) this._startAnim(this._anim.type); // restart at new cadence
+    else this._renderAnimPanel();
+  }
+
+  _animTiming(type) {
+    const mult = ANIM_SPEEDS[this._animSpeed] || 1;
+    // [intervalMs, transitionS] per type, scaled by speed
+    const base = {
+      cycle: [ANIM_BASE_MS, ANIM_BASE_MS / 1000],
+      palette: [ANIM_BASE_MS, ANIM_BASE_MS / 1000],
+      breathe: [ANIM_BASE_MS * 1.3, (ANIM_BASE_MS * 1.3) / 1000],
+      candle: [620, 0.35], // fast, snappy flickers
+      sunrise: [8000, 8], // slow keyframes over the ramp
+    }[type] || [ANIM_BASE_MS, ANIM_BASE_MS / 1000];
+    const interval = Math.round(base[0] * mult);
+    const transition = Math.max(0.2, base[1] * mult);
+    return { interval, transition };
+  }
+
+  /** Targets for an animation: the current selection, else all on lights. */
+  _animTargets() {
+    const sel = [...this._brightnessTargets()];
+    return sel.length ? sel : this._onLightIds();
+  }
+
+  _startAnim(type) {
+    if (!ANIM_TYPES.includes(type)) return;
+    this._stopAnim();
+    const targets = this._animTargets();
+    if (!targets.length) return;
+    this._anim = { type, targets, phase: 0, t0: Date.now(), timer: null };
+    this._modeAnimBtn.classList.add("running");
+    if (this._animOpen) this._renderAnimPanel();
+    this._haptic(10);
+    this._animTick();
+  }
+
+  _stopAnim() {
+    if (!this._anim) return;
+    clearTimeout(this._anim.timer);
+    this._anim = null;
+    this._modeAnimBtn?.classList.remove("running");
+    if (this._animOpen) this._renderAnimPanel();
+  }
+
+  _animTick() {
+    const a = this._anim;
+    if (!a || !this._hass) return;
+    const { interval, transition } = this._animTiming(a.type);
+    // re-evaluate live targets so newly-on lights join (cheap)
+    const targets = a.targets.filter((e) => this._hass.states[e]);
+    if (targets.length) this._animStep(a, targets, transition);
+    a.phase += 1;
+    a.timer = setTimeout(() => this._animTick(), interval);
+  }
+
+  /** Compute and send one animation keyframe for the active type. */
+  _animStep(a, targets, transition) {
+    const call = (data) =>
+      this._hass.callService("light", "turn_on", { entity_id: targets, transition, ...data });
+    switch (a.type) {
+      case "cycle": {
+        const hue = (a.phase * 24) % 360; // ~15 steps around the wheel
+        call({ hs_color: [hue, 95] });
+        break;
+      }
+      case "palette": {
+        const pal = this._animPalette.length ? this._animPalette : [[0, 95], [120, 95], [240, 95]];
+        if (pal.length === 1) {
+          call({ hs_color: [pal[0][0], pal[0][1]] });
+          break;
+        }
+        // smoothly interpolate along the chosen colors, looping
+        const seg = a.phase % pal.length;
+        const from = pal[seg];
+        const to = pal[(seg + 1) % pal.length];
+        const hs = this._lerpHs(from, to, 0); // step to each waypoint; bulb fades between
+        call({ hs_color: hs });
+        break;
+      }
+      case "breathe": {
+        const lo = 12, hi = 100;
+        const pct = a.phase % 2 === 0 ? lo : hi;
+        call({ brightness_pct: pct });
+        break;
+      }
+      case "candle": {
+        const flicker = 55 + Math.round(Math.random() * 40); // 55-95%
+        const warm = 1900 + Math.round(Math.random() * 300); // 1900-2200K
+        call({ brightness_pct: flicker, color_temp_kelvin: warm });
+        break;
+      }
+      case "sunrise": {
+        const elapsed = (Date.now() - a.t0) / 1000;
+        const duration = (this._config.sunrise_minutes || 10) * 60;
+        const p = Math.min(elapsed / duration, 1);
+        call({
+          brightness_pct: Math.max(1, Math.round(p * 100)),
+          color_temp_kelvin: Math.round(2000 + p * 2500),
+        });
+        if (p >= 1) this._stopAnim();
+        break;
+      }
+    }
+  }
+
+  _lerpHs(a, b, t) {
+    // shortest-path hue interpolation
+    let dh = ((b[0] - a[0] + 540) % 360) - 180;
+    return [Math.round((a[0] + dh * t + 360) % 360), Math.round(a[1] + (b[1] - a[1]) * t)];
+  }
+
   _haptic(ms) {
     if (!this._config.enable_haptics) return;
     try {
@@ -1105,6 +1385,7 @@ class HueColorWheelCard extends HTMLElement {
     }
     const targets = this._brightnessTargets();
     if (targets.size) {
+      this._stopAnim();
       // tap-to-place: send the selected lights to the tapped value
       const rect = this._wheelWrap.getBoundingClientRect();
       const r = rect.width / 2;
@@ -1679,6 +1960,7 @@ class HueColorWheelCard extends HTMLElement {
       if (Math.sqrt(dxp * dxp + dyp * dyp) < TAP_SLOP_PX) return;
       drag.moved = true;
       clearTimeout(this._longPressTimer); // a real drag cancels the long-press
+      this._stopAnim(); // taking manual control stops any running animation
       for (const id of drag.members) {
         this._pins.get(id).el.classList.add("dragging", "show-label");
       }
@@ -2007,6 +2289,7 @@ class HueColorWheelCard extends HTMLElement {
   _setMode(mode) {
     if (mode !== "color" && mode !== "white") return;
     if (mode === this._mode) return;
+    this._stopAnim();
     this._applyMode(mode);
     this._multi.clear();
     this._selectedCluster = null;
@@ -2417,6 +2700,15 @@ class HueColorWheelCard extends HTMLElement {
     if (typeof data.groupSeq === "number") {
       this._groupSeq = Math.max(this._groupSeq, data.groupSeq);
     }
+    if (Array.isArray(data.animPalette)) {
+      this._animPalette = data.animPalette.filter((c) => Array.isArray(c)).map((c) => [c[0], c[1]]);
+    } else if (Array.isArray(this._config.animation_palette) && !this._animPalette.length) {
+      this._animPalette = this._config.animation_palette.map((c) => [c[0], c[1]]);
+    }
+    if (typeof data.animSpeed === "string" && ANIM_SPEEDS[data.animSpeed]) {
+      this._animSpeed = data.animSpeed;
+    }
+    if (this._animOpen) this._renderAnimPanel();
     if (Array.isArray(data.clusters)) {
       this._clusters = data.clusters
         .map((c) => ({
@@ -2440,6 +2732,8 @@ class HueColorWheelCard extends HTMLElement {
       updatedAt: Date.now(),
       mode: this._mode,
       groupSeq: this._groupSeq,
+      animPalette: this._animPalette,
+      animSpeed: this._animSpeed,
       clusters: this._clusters.map((c) => ({
         members: [...c.members],
         hs: c.hs,
