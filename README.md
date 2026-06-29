@@ -39,6 +39,11 @@ time. No build step, no dependencies — a single JS file.
   slider shows a percentage.
 - **Predefined groups** via the `groups:` config option, always present and
   named, on top of the runtime merge-by-drop grouping.
+- **House view**: a home icon in the header zooms out to a grid of room
+  tiles, each showing the room's combined color and how many lights are on.
+  **Drag a room's color onto another room** to copy it; **tap a tile** to
+  toggle that room on/off. Rooms come from the `rooms:` config (or fall back
+  to `groups:`).
 - One labeled pin per configured light, positioned at its current
   `hs_color` and filled with its actual current color (`rgb_color`).
 - Drag a pin (mouse or touch) to call `light.turn_on` with the new
@@ -140,7 +145,12 @@ show_presets: true       # show the preset save button and chips, default true
 show_white_toggle: true  # show the color/white (temperature) mode toggle, default true
 show_swatches: true      # show the quick-color swatch row + randomize button, default true
 show_effects: true       # show the effects toggle when lights support effects, default true
+show_animations: true    # show the animation engine (play-button pill), default true
 enable_haptics: true     # vibrate on merge / long-press on supported devices, default true
+sunrise_minutes: 10      # duration of the Sunrise animation ramp, default 10
+animation_palette:       # optional seed colors for the Palette animation, [hue, sat] pairs
+  - [20, 100]
+  - [300, 90]
 swatches:                # optional custom quick-colors as [hue, saturation] pairs
   - [0, 100]
   - [40, 100]
@@ -155,6 +165,18 @@ groups:
     entities:
       - light.patio_can_1
       - light.patio_can_2
+
+# Optional rooms for the House view (falls back to `groups` if omitted):
+rooms:
+  - name: Patio
+    icon: mdi:flower
+    entities:
+      - light.patio_can_1
+      - light.patio_can_2
+  - name: Living Room
+    entities:
+      - light.tv_strip
+      - light.lamp
 ```
 
 Entries in `lights` may also be plain entity IDs:
