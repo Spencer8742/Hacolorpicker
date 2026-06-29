@@ -14,8 +14,17 @@ time. No build step, no dependencies — a single JS file.
   cool blue-white at the bottom). In white mode, dragging a pin up/down sets
   the light's `color_temp` instead of `hs_color`. Color-temp-only lights
   (which can't show on the color wheel) become draggable in white mode.
-- **Effects**: when any light advertises effects, a third pill appears that
-  opens an effects chooser (applies `light.turn_on` with `effect`).
+- **Effects**: when any light advertises effects, a pill appears that opens an
+  effects chooser (applies `light.turn_on` with `effect`).
+- **Animation engine**: a play-button pill opens an animations panel with
+  **Color cycle**, **Breathe**, **Candle**, **Sunrise**, and **Palette**
+  (cycles through colors you pick). The card drives the animation itself with
+  sparse keyframes + the light `transition` param, so it stays smooth without
+  flooding the WebSocket. Animations target the current selection (or all on
+  lights), have a slow/medium/fast speed, and stop the moment you take manual
+  control. The palette and speed are saved/synced; seed colors with
+  `animation_palette`. Note: the animation runs while the card is open (it's
+  frontend-driven), so closing the dashboard stops it.
 - **Teardrop pins with icons** tinted to each light's color; labels are
   auto-decluttered (only the selected, dragged, or grouped pins show a name).
 - **Quick-color swatches** + a randomize button below the wheel; tap a swatch
@@ -30,6 +39,11 @@ time. No build step, no dependencies — a single JS file.
   slider shows a percentage.
 - **Predefined groups** via the `groups:` config option, always present and
   named, on top of the runtime merge-by-drop grouping.
+- **House view**: a home icon in the header zooms out to a grid of room
+  tiles, each showing the room's combined color and how many lights are on.
+  **Drag a room's color onto another room** to copy it; **tap a tile** to
+  toggle that room on/off. Rooms come from the `rooms:` config (or fall back
+  to `groups:`).
 - One labeled pin per configured light, positioned at its current
   `hs_color` and filled with its actual current color (`rgb_color`).
 - Drag a pin (mouse or touch) to call `light.turn_on` with the new
@@ -131,7 +145,12 @@ show_presets: true       # show the preset save button and chips, default true
 show_white_toggle: true  # show the color/white (temperature) mode toggle, default true
 show_swatches: true      # show the quick-color swatch row + randomize button, default true
 show_effects: true       # show the effects toggle when lights support effects, default true
+show_animations: true    # show the animation engine (play-button pill), default true
 enable_haptics: true     # vibrate on merge / long-press on supported devices, default true
+sunrise_minutes: 10      # duration of the Sunrise animation ramp, default 10
+animation_palette:       # optional seed colors for the Palette animation, [hue, sat] pairs
+  - [20, 100]
+  - [300, 90]
 swatches:                # optional custom quick-colors as [hue, saturation] pairs
   - [0, 100]
   - [40, 100]
@@ -146,6 +165,18 @@ groups:
     entities:
       - light.patio_can_1
       - light.patio_can_2
+
+# Optional rooms for the House view (falls back to `groups` if omitted):
+rooms:
+  - name: Patio
+    icon: mdi:flower
+    entities:
+      - light.patio_can_1
+      - light.patio_can_2
+  - name: Living Room
+    entities:
+      - light.tv_strip
+      - light.lamp
 ```
 
 Entries in `lights` may also be plain entity IDs:
