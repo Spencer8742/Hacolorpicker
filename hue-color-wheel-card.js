@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.12.1";
+const CARD_VERSION = "0.12.2";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -3138,12 +3138,12 @@ class HueColorWheelCard extends HTMLElement {
   /* ------------------------------------------------------------ presets */
 
   _capturePreset(name) {
-    const snapshot = {};
+    const lights = {};
     for (const entity of this._pins.keys()) {
       const s = this._hass.states[entity];
       if (!s || s.state === "unavailable" || s.state === "unknown") continue;
       const hs = this._lastHs.get(entity) || s.attributes.hs_color || [0, 0];
-      snapshot[entity] = {
+      lights[entity] = {
         on: s.state === "on",
         hs: [hs[0], hs[1]],
         brightness_pct:
@@ -3152,7 +3152,17 @@ class HueColorWheelCard extends HTMLElement {
             : null,
       };
     }
-    this._presets[name] = snapshot;
+    // save the groups too (with names), so recalling the preset restores the
+    // exact arrangement it was saved in — not a pile of individual lights
+    const clusters = this._clusters.map((c) => ({
+      members: [...c.members],
+      hs: c.hs,
+      temp: c.temp,
+      whiteX: c.whiteX,
+      no: c.no,
+      name: c.name,
+    }));
+    this._presets[name] = { v: 2, lights, clusters };
     this._scheduleSave();
     this._renderPresets();
   }
@@ -3164,25 +3174,49 @@ class HueColorWheelCard extends HTMLElement {
   }
 
   _applyPreset(name) {
-    const snapshot = this._presets[name];
-    if (!snapshot) return;
-    // presets recall exact per-light positions, so dissolve any stacks
-    this._clusters = [];
+    const preset = this._presets[name];
+    if (!preset) return;
+    // back-compat: pre-0.12.2 presets were a flat per-entity map
+    const lights = preset.lights || preset;
+    if (this._expandedCluster) this._closeCluster();
     this._selectedCluster = null;
     this._multi.clear();
-    this._refreshClusterStyles();
-    this._scheduleSave();
-    for (const [entity, saved] of Object.entries(snapshot)) {
+    // Restore the exact groups saved with the preset (names included). Older
+    // presets have no cluster data — leave the current groups untouched
+    // rather than dissolving them.
+    if (Array.isArray(preset.clusters)) {
+      this._clusters = preset.clusters
+        .map((c) => ({
+          members: (c.members || []).filter((id) => this._pins.has(id)),
+          hs: Array.isArray(c.hs) ? c.hs.slice(0, 2) : [0, 0],
+          temp: c.temp || DEFAULT_TEMP_K,
+          whiteX: typeof c.whiteX === "number" ? c.whiteX : 0,
+          no: c.no || ++this._groupSeq,
+          name: c.name || null,
+          settleUntil: Date.now() + CLUSTER_SETTLE_MS,
+        }))
+        .filter((c) => c.members.length >= 2);
+    }
+    this._refreshClusterStyles(); // collapse restored stacks (badges + hidden)
+    this._refreshSelection();
+    for (const [entity, saved] of Object.entries(lights)) {
       const pin = this._pins.get(entity);
       if (!pin || pin.el.classList.contains("unavailable")) continue;
       if (saved.on) {
-        // move the pin optimistically with a slow ease; the subsequent
-        // hass updates land on the same position, so no snap-back
+        // move the pin optimistically with a slow ease; the subsequent hass
+        // updates land on the same spot, so no snap-back. Grouped members
+        // move to their stack; loose lights to their own saved position.
+        const cluster = this._clusterFor(entity);
         pin.el.classList.add("animating");
         pin.el.classList.remove("off");
         this._lastHs.set(entity, saved.hs);
-        this._positionPin(pin, saved.hs);
-        pin.circle.style.background = rgbCss(hsv2rgb(saved.hs[0], saved.hs[1] / 100, 1));
+        const [x, y] = cluster
+          ? this._clusterXY(cluster)
+          : hsToXy(saved.hs[0], saved.hs[1], this._radius);
+        pin.el.style.transform = `translate(${this._radius + x}px, ${this._radius + y}px)`;
+        const rgb = hsv2rgb(saved.hs[0], saved.hs[1] / 100, 1);
+        pin.circle.style.background = rgbCss(rgb);
+        if (pin.icon) pin.icon.style.color = this._contrastColor(rgb);
         const data = { entity_id: entity, hs_color: saved.hs };
         if (saved.brightness_pct != null) data.brightness_pct = saved.brightness_pct;
         this._hass.callService("light", "turn_on", data);
@@ -3190,6 +3224,7 @@ class HueColorWheelCard extends HTMLElement {
         this._hass.callService("light", "turn_off", { entity_id: entity });
       }
     }
+    this._scheduleSave();
     clearTimeout(this._animTimer);
     this._animTimer = setTimeout(() => {
       for (const pin of this._pins.values()) pin.el.classList.remove("animating");

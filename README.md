@@ -74,8 +74,10 @@ time. No build step, no dependencies — a single JS file.
   any selected pin — the whole group moves together, keeping its relative
   arrangement on the wheel. The brightness slider applies to the selection.
 - **Presets**: a "Save preset" button snapshots every light's current
-  color, brightness, and on/off state. Saved presets appear as chips —
-  tap one to activate it, tap its ✕ to delete it.
+  color, brightness, and on/off state — **and the current groups (with
+  their names)**. Recalling a preset restores it exactly as saved, groups
+  and all. Saved presets appear as chips — tap one to activate it, tap its
+  ✕ to delete it.
 - **Animation**: activating a preset glides the pins smoothly to their new
   positions instead of snapping.
 - Pins update live when colors change externally (automations, the Hue
