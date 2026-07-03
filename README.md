@@ -63,7 +63,13 @@ time. No build step, no dependencies — a single JS file.
 - **Groups are sticky** — once grouped, lights stay grouped through on/off
   changes, external recoloring, scenes, and switching between color and
   white modes. Membership only changes when you explicitly merge two pins or
-  drag one out of an open ring, so you never have to rebuild a group.
+  drag one out of an open ring, so you never have to rebuild a group. A
+  group keeps its name when you add or remove lights (until only one is
+  left, which dissolves it).
+- **Rename / ungroup**: open a group's ring (tap the stack) and a control
+  bar appears below the wheel — type a new name, or hit **Ungroup** to
+  disband the whole group at once. (Long-pressing a stack also offers the
+  same.)
 - **Multi-select & group drag**: tap several pins to select them, then drag
   any selected pin — the whole group moves together, keeping its relative
   arrangement on the wheel. The brightness slider applies to the selection.

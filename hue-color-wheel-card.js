@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.12.0";
+const CARD_VERSION = "0.12.1";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -919,6 +919,28 @@ class HueColorWheelCard extends HTMLElement {
           transform: translate(-50%, -50%); pointer-events: none; opacity: 0.92;
         }
         .house-ghost[hidden] { display: none; }
+        /* controls shown while a group's ring is open: rename + ungroup */
+        .ring-controls {
+          display: flex; align-items: center; justify-content: center; gap: 8px;
+          margin-top: 12px; flex-wrap: wrap;
+        }
+        .ring-controls[hidden] { display: none; }
+        .ring-name {
+          font: inherit; font-size: 13px;
+          color: var(--primary-text-color, #e1e1e1);
+          background: rgba(255,255,255,0.08);
+          border: 1px solid rgba(255,255,255,0.2);
+          border-radius: 10px; padding: 7px 12px; width: 160px; outline: none;
+        }
+        .ring-ungroup {
+          font: inherit; font-size: 13px; cursor: pointer;
+          color: #ff6b6b;
+          background: rgba(255,107,107,0.1);
+          border: 1px solid rgba(255,107,107,0.35);
+          border-radius: 10px; padding: 7px 14px;
+          display: inline-flex; align-items: center; gap: 6px; --mdc-icon-size: 17px;
+        }
+        .ring-ungroup:hover { background: rgba(255,107,107,0.2); }
       </style>
       <ha-card>
         <div class="card-header">
@@ -933,6 +955,10 @@ class HueColorWheelCard extends HTMLElement {
           <div class="tray-name" hidden></div>
           <div class="pins"></div>
           <div class="value-readout"></div>
+        </div>
+        <div class="ring-controls" hidden>
+          <input class="ring-name" type="text" maxlength="24" placeholder="Group name" aria-label="Group name">
+          <button class="ring-ungroup"><ha-icon icon="mdi:ungroup"></ha-icon>Ungroup</button>
         </div>
         <div class="toolbar">
           <div class="mode-toggle">
@@ -997,6 +1023,15 @@ class HueColorWheelCard extends HTMLElement {
     this._houseToggle = this.shadowRoot.querySelector(".house-toggle");
     this._houseGhost = this.shadowRoot.querySelector(".house-ghost");
     this._houseToggle.addEventListener("click", () => this._toggleHouseView());
+    this._ringControls = this.shadowRoot.querySelector(".ring-controls");
+    this._ringNameInput = this.shadowRoot.querySelector(".ring-name");
+    this._ringNameInput.addEventListener("change", () => this._renameOpenGroup());
+    this._ringNameInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") this._ringNameInput.blur();
+    });
+    this.shadowRoot
+      .querySelector(".ring-ungroup")
+      .addEventListener("click", () => this._ungroupOpen());
     this._modeColorBtn.addEventListener("click", () => this._setMode("color"));
     this._modeWhiteBtn.addEventListener("click", () => this._setMode("white"));
     this._modeFxBtn.addEventListener("click", () => this._toggleEffectsPanel());
@@ -2461,11 +2496,37 @@ class HueColorWheelCard extends HTMLElement {
       this._trayNameEl.style.left = `${r + cx}px`;
       this._trayNameEl.style.top = `${r + cy}px`;
     }
+    if (this._ringControls) {
+      this._ringControls.hidden = false;
+      this._ringNameInput.value = cluster.name || "";
+      this._ringNameInput.placeholder = this._groupName(cluster);
+    }
     this._selectedCluster = cluster;
     this._multi = new Set(cluster.members);
     this._refreshClusterStyles();
     this._layoutExpanded();
     this._refreshSelection();
+  }
+
+  /** Rename the currently-open group from the ring-controls input. */
+  _renameOpenGroup() {
+    const cluster = this._expandedCluster;
+    if (!cluster) return;
+    cluster.name = this._ringNameInput.value.trim() || null;
+    if (this._trayNameEl) this._trayNameEl.textContent = this._groupName(cluster);
+    this._ringNameInput.placeholder = this._groupName(cluster);
+    this._scheduleSave();
+    this._updateAll();
+  }
+
+  /** Disband the currently-open group entirely, then close the ring. */
+  _ungroupOpen() {
+    const cluster = this._expandedCluster;
+    if (!cluster) return;
+    this._clusters = this._clusters.filter((c) => c !== cluster);
+    this._scheduleSave();
+    this._haptic(12);
+    this._closeCluster();
   }
 
   _layoutExpanded() {
@@ -2522,6 +2583,7 @@ class HueColorWheelCard extends HTMLElement {
     }
     if (this._trayEl) this._trayEl.hidden = true;
     if (this._trayNameEl) this._trayNameEl.hidden = true;
+    if (this._ringControls) this._ringControls.hidden = true;
     this._selectedCluster = null;
     this._multi.clear();
     this._refreshClusterStyles();
@@ -2691,22 +2753,28 @@ class HueColorWheelCard extends HTMLElement {
 
   _mergeInto(targetEntity, draggedMembers) {
     const targetCluster = this._clusterFor(targetEntity);
+    const moved = [...draggedMembers];
+    // Keep the group's identity (number AND custom name) stable when lights
+    // are added: inherit from the drop-target group, or from a dragged group
+    // if the target was a lone light. Only a brand-new pairing gets a number.
+    const idCluster =
+      targetCluster || moved.map((id) => this._clusterFor(id)).find(Boolean) || null;
     // carry both a color and a temperature so the group works in either mode
     const hs = (targetCluster ? targetCluster.hs : this._lastHs.get(targetEntity) || [0, 0]).slice();
     const temp = targetCluster
       ? targetCluster.temp || DEFAULT_TEMP_K
       : this._lastTemp.get(targetEntity) || DEFAULT_TEMP_K;
-    const no = targetCluster ? targetCluster.no : ++this._groupSeq;
-    const whiteX = targetCluster?.whiteX ?? 0;
+    const no = idCluster ? idCluster.no : ++this._groupSeq;
+    const name = idCluster ? idCluster.name || null : null;
+    const whiteX = targetCluster?.whiteX ?? idCluster?.whiteX ?? 0;
     const members = targetCluster ? [...targetCluster.members] : [targetEntity];
-    const moved = [...draggedMembers];
     this._clusters = this._clusters.filter(
       (c) => c !== targetCluster && !moved.some((id) => c.members.includes(id))
     );
     for (const id of moved) {
       if (!members.includes(id)) members.push(id);
     }
-    const cluster = { members, hs, temp, no, whiteX, settleUntil: Date.now() + CLUSTER_SETTLE_MS };
+    const cluster = { members, hs, temp, no, name, whiteX, settleUntil: Date.now() + CLUSTER_SETTLE_MS };
     this._clusters.push(cluster);
     this._scheduleSave();
     const [cx, cy] = this._clusterXY(cluster);
