@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.13.0";
+const CARD_VERSION = "0.13.1";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -3491,19 +3491,26 @@ class HueColorWheelCard extends HTMLElement {
   }
 }
 
-customElements.define("hue-color-wheel-card", HueColorWheelCard);
+// Guard against being loaded twice (e.g. a stale /local resource alongside the
+// HACS one): re-defining a registered element name throws, so only register
+// once instead of crashing.
+if (!customElements.get("hue-color-wheel-card")) {
+  customElements.define("hue-color-wheel-card", HueColorWheelCard);
 
-console.info(
-  `%c HUE-COLOR-WHEEL-CARD %c v${CARD_VERSION} `,
-  "background:#3f51b5;color:#fff;padding:2px 6px;border-radius:4px 0 0 4px",
-  "background:#222;color:#9fa8da;padding:2px 6px;border-radius:0 4px 4px 0"
-);
+  console.info(
+    `%c HUE-COLOR-WHEEL-CARD %c v${CARD_VERSION} `,
+    "background:#3f51b5;color:#fff;padding:2px 6px;border-radius:4px 0 0 4px",
+    "background:#222;color:#9fa8da;padding:2px 6px;border-radius:0 4px 4px 0"
+  );
 
-window.customCards = window.customCards || [];
-window.customCards.push({
-  type: "hue-color-wheel-card",
-  name: "Hue Color Wheel Card",
-  description:
-    "Philips Hue style color wheel with a draggable pin per light. Drag pins to change colors in real time.",
-  preview: false,
-});
+  window.customCards = window.customCards || [];
+  if (!window.customCards.some((c) => c.type === "hue-color-wheel-card")) {
+    window.customCards.push({
+      type: "hue-color-wheel-card",
+      name: "Hue Color Wheel Card",
+      description:
+        "Philips Hue style color wheel with a draggable pin per light. Drag pins to change colors in real time.",
+      preview: false,
+    });
+  }
+}
