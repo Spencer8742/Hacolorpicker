@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.12.2";
+const CARD_VERSION = "0.13.0";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -269,6 +269,7 @@ class HueColorWheelCard extends HTMLElement {
     if (this._drag && this._drag.cleanup) this._drag.cleanup();
     this._drag = null;
     clearTimeout(this._longPressTimer);
+    clearTimeout(this._sceneNoteTimer);
     this._stopAnim();
     for (const p of this._pendingCalls.values()) clearTimeout(p.timer);
     this._pendingCalls.clear();
@@ -748,7 +749,7 @@ class HueColorWheelCard extends HTMLElement {
           gap: 8px;
           margin-top: 14px;
         }
-        .chip, .save-btn, .save-ok, .save-cancel {
+        .chip, .save-btn, .save-ok, .save-cancel, .scene-btn, .scene-ok, .scene-cancel {
           font: inherit;
           font-size: 13px;
           color: var(--primary-text-color, #e1e1e1);
@@ -762,8 +763,23 @@ class HueColorWheelCard extends HTMLElement {
           gap: 6px;
           min-height: 32px;
           box-sizing: border-box;
+          --mdc-icon-size: 16px;
         }
-        .chip:hover, .save-btn:hover { background: rgba(255,255,255,0.16); }
+        .chip:hover, .save-btn:hover, .scene-btn:hover { background: rgba(255,255,255,0.16); }
+        .scene-form { display: inline-flex; align-items: center; gap: 6px; }
+        .scene-form[hidden], .scene-btn[hidden] { display: none; }
+        .scene-form input {
+          font: inherit; font-size: 13px;
+          color: var(--primary-text-color, #e1e1e1);
+          background: rgba(255,255,255,0.08);
+          border: 1px solid rgba(255,255,255,0.25);
+          border-radius: 8px; padding: 6px 10px; width: 150px; outline: none;
+        }
+        .scene-note {
+          margin-top: 8px; font-size: 12px;
+          color: var(--secondary-text-color, #9e9e9e);
+        }
+        .scene-note[hidden] { display: none; }
         .chip-del {
           opacity: 0.6;
           font-size: 14px;
@@ -989,7 +1005,14 @@ class HueColorWheelCard extends HTMLElement {
             <button class="save-ok">Save</button>
             <button class="save-cancel">✕</button>
           </span>
+          <button class="scene-btn" title="Save the current lights as a Home Assistant scene"><ha-icon icon="mdi:palette-swatch"></ha-icon>Save as scene</button>
+          <span class="scene-form" hidden>
+            <input type="text" maxlength="40" placeholder="Scene name" aria-label="Scene name">
+            <button class="scene-ok">Create scene</button>
+            <button class="scene-cancel">✕</button>
+          </span>
         </div>
+        <div class="scene-note" hidden></div>
         <div class="ct-note" hidden></div>
         </div>
         <div class="house-view" hidden></div>
@@ -1078,6 +1101,34 @@ class HueColorWheelCard extends HTMLElement {
     this._saveInput.addEventListener("keydown", (ev) => {
       if (ev.key === "Enter") commitSave();
       if (ev.key === "Escape") closeSaveForm();
+    });
+
+    // "Save as scene" -> creates a real Home Assistant scene
+    this._sceneBtn = this.shadowRoot.querySelector(".scene-btn");
+    this._sceneForm = this.shadowRoot.querySelector(".scene-form");
+    this._sceneInput = this.shadowRoot.querySelector(".scene-form input");
+    this._sceneNote = this.shadowRoot.querySelector(".scene-note");
+    this._sceneBtn.addEventListener("click", () => {
+      this._sceneBtn.hidden = true;
+      this._sceneForm.hidden = false;
+      this._sceneInput.value = this._headerTitle() + " scene";
+      this._sceneInput.focus();
+      this._sceneInput.select?.();
+    });
+    const closeSceneForm = () => {
+      this._sceneForm.hidden = true;
+      this._sceneBtn.hidden = false;
+    };
+    this.shadowRoot.querySelector(".scene-cancel").addEventListener("click", closeSceneForm);
+    const commitScene = () => {
+      const name = this._sceneInput.value.trim();
+      closeSceneForm();
+      if (name) this._saveScene(name);
+    };
+    this.shadowRoot.querySelector(".scene-ok").addEventListener("click", commitScene);
+    this._sceneInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") commitScene();
+      if (ev.key === "Escape") closeSceneForm();
     });
 
     this._pins.clear();
@@ -3171,6 +3222,91 @@ class HueColorWheelCard extends HTMLElement {
     delete this._presets[name];
     this._scheduleSave();
     this._renderPresets();
+  }
+
+  /* ---------------------------------------------- save as HA scene */
+
+  _slugify(s) {
+    return (
+      s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 40) ||
+      "scene"
+    );
+  }
+
+  /** Snapshot the lights' current state into a scene `entities` map. */
+  _sceneEntities() {
+    const entities = {};
+    for (const entity of this._pins.keys()) {
+      const s = this._hass.states[entity];
+      if (!s || s.state === "unavailable" || s.state === "unknown") continue;
+      if (s.state !== "on") {
+        entities[entity] = { state: "off" };
+        continue;
+      }
+      const a = s.attributes || {};
+      const e = { state: "on" };
+      if (a.brightness != null) e.brightness = a.brightness;
+      if (a.color_temp_kelvin != null) e.color_temp_kelvin = a.color_temp_kelvin;
+      else if (Array.isArray(a.hs_color)) e.hs_color = a.hs_color;
+      else if (Array.isArray(a.rgb_color)) e.rgb_color = a.rgb_color;
+      entities[entity] = e;
+    }
+    return entities;
+  }
+
+  /**
+   * Save the current lights as a real Home Assistant scene. Prefers a
+   * persistent scene (survives restarts, editable in the UI, usable in
+   * automations) via the config API the scene editor uses; falls back to a
+   * runtime scene.create if that isn't permitted.
+   */
+  async _saveScene(name) {
+    const entities = this._sceneEntities();
+    if (!Object.keys(entities).length) {
+      this._showSceneNote("No available lights to save.");
+      return;
+    }
+    const id = String(Date.now());
+    try {
+      await this._hass.callApi("POST", `config/scene/config/${id}`, {
+        id,
+        name,
+        icon: this._config.icon || "mdi:palette",
+        entities,
+      });
+      // reload so the scene.<name> entity appears right away
+      await this._hass.callService("scene", "reload").catch(() => {});
+      this._showSceneNote(
+        `Saved scene “${name}”. Find it in Settings → Automations & Scenes → Scenes.`
+      );
+      this._haptic(12);
+      return;
+    } catch (e) {
+      // not an admin / older HA — fall back to a runtime scene
+    }
+    try {
+      const sceneId = this._slugify(name);
+      await this._hass.callService("scene", "create", {
+        scene_id: sceneId,
+        snapshot_entities: Object.keys(entities),
+      });
+      this._showSceneNote(
+        `Created scene.${sceneId} (temporary — it works in automations now but is lost on restart; admin rights are needed to make it permanent).`
+      );
+      this._haptic(12);
+    } catch (e2) {
+      this._showSceneNote("Couldn’t create the scene (permission denied or unsupported).");
+    }
+  }
+
+  _showSceneNote(text) {
+    if (!this._sceneNote) return;
+    this._sceneNote.textContent = text;
+    this._sceneNote.hidden = false;
+    clearTimeout(this._sceneNoteTimer);
+    this._sceneNoteTimer = setTimeout(() => {
+      if (this._sceneNote) this._sceneNote.hidden = true;
+    }, 9000);
   }
 
   _applyPreset(name) {
