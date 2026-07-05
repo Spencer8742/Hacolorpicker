@@ -77,7 +77,13 @@ time. No build step, no dependencies — a single JS file.
   color, brightness, and on/off state — **and the current groups (with
   their names)**. Recalling a preset restores it exactly as saved, groups
   and all. Saved presets appear as chips — tap one to activate it, tap its
-  ✕ to delete it.
+  ✕ to delete it. (Presets are card-local; use **Save as scene** for
+  something automations can use.)
+- **Save as scene**: a button that saves the current lights as a real Home
+  Assistant **scene** (`scene.<name>`), so you can trigger it from
+  automations, scripts, buttons, or voice. It creates a persistent scene via
+  the same API the scene editor uses (admins); for non-admins it falls back
+  to a temporary `scene.create` scene (works until the next restart).
 - **Animation**: activating a preset glides the pins smoothly to their new
   positions instead of snapping.
 - Pins update live when colors change externally (automations, the Hue
