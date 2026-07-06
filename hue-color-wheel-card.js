@@ -12,7 +12,7 @@
  * No build step, no dependencies.
  */
 
-const CARD_VERSION = "0.13.1";
+const CARD_VERSION = "0.13.2";
 
 const DEFAULTS = {
   wheel_size: 300,
@@ -191,11 +191,16 @@ class HueColorWheelCard extends HTMLElement {
         if (this._pendingSave) this._syncRemote();
       } else {
         this._syncFromServer();
+        // mobile webviews discard canvas pixels while backgrounded — force a
+        // redraw of the wheel in the current mode so it isn't blank/stale
+        this._redrawWheel();
       }
     };
     this._flushHandler = () => {
       if (this._pendingSave) this._syncRemote();
     };
+    // returning from the back/forward cache (bfcache) also needs a repaint
+    this._pageShowHandler = () => this._redrawWheel();
     this._multi = new Set(); // entities selected for group drag / brightness
     this._selectedCluster = null; // cluster selected for brightness (first tap)
     this._clusters = []; // merged pin stacks: {members, hs, temp, no}
@@ -256,8 +261,11 @@ class HueColorWheelCard extends HTMLElement {
 
   connectedCallback() {
     window.addEventListener("pagehide", this._flushHandler);
+    window.addEventListener("pageshow", this._pageShowHandler);
     document.addEventListener("visibilitychange", this._visibilityHandler);
     this._maybeBuild();
+    // if we're re-attached to a laid-out card, make sure the wheel is painted
+    this._redrawWheel();
   }
 
   disconnectedCallback() {
@@ -275,6 +283,7 @@ class HueColorWheelCard extends HTMLElement {
     this._pendingCalls.clear();
     clearTimeout(this._animTimer);
     window.removeEventListener("pagehide", this._flushHandler);
+    window.removeEventListener("pageshow", this._pageShowHandler);
     document.removeEventListener("visibilitychange", this._visibilityHandler);
     if (this._unsub) {
       this._unsub();
@@ -1892,6 +1901,17 @@ class HueColorWheelCard extends HTMLElement {
   }
 
   /* ------------------------------------------------------------ wheel */
+
+  /**
+   * Force the wheel canvas to repaint in the current mode. Needed because
+   * mobile webviews (iOS/Android) throw away canvas pixels when the app is
+   * backgrounded, and _onResize alone won't redraw if the size is unchanged.
+   */
+  _redrawWheel() {
+    if (!this._built || !this._canvas) return;
+    this._renderedSize = 0; // invalidate so _onResize actually redraws
+    this._onResize();
+  }
 
   _onResize() {
     const rect = this._wheelWrap.getBoundingClientRect();
